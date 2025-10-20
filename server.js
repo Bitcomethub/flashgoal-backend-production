@@ -165,6 +165,7 @@ app.post('/api/predictions', async (req, res) => {
       prediction_type,
       odds,
       confidence
+    } = req.body;
 
 // Update prediction result
 app.put('/api/predictions/:id/result', async (req, res) => {
