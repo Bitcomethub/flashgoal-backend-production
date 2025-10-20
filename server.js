@@ -165,8 +165,48 @@ app.post('/api/predictions', async (req, res) => {
       prediction_type,
       odds,
       confidence
-    } = req.body;
 
+// Update prediction result
+app.put('/api/predictions/:id/result', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { result } = req.body;
+
+    if (!result || !['won', 'lost'].includes(result)) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Result must be "won" or "lost"' 
+      });
+    }
+
+    const updateResult = await pool.query(
+      'UPDATE predictions SET result = $1, updated_at = NOW() WHERE id = $2 RETURNING *',
+      [result, id]
+    );
+
+    if (updateResult.rows.length === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'Prediction not found' 
+      });
+    }
+
+    res.json({
+      success: true,
+      message: `Prediction marked as ${result}`,
+      prediction: updateResult.rows[0]
+    });
+  } catch (error) {
+    console.error('Update result error:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Failed to update prediction result' 
+    });
+  }
+});
+
+
+// Update prediction result
     // Validation
     if (!match_id || !home_team || !away_team || !prediction_type) {
       return res.status(400).json({
