@@ -325,6 +325,62 @@ app.get('/', (req, res) => {
   });
 });
 
+
+// ============================================
+// AUTOMATIC PREDICTION RESULT CHECKER (30s)
+// ============================================
+const cron = require("node-cron");
+
+// Her 30 saniyede bir çalış
+cron.schedule("*/30 * * * * *", async () => {
+  try {
+    console.log("🔄 Checking predictions...");
+    const { rows: activePredictions } = await pool.query(
+      "SELECT * FROM predictions WHERE result IS NULL"
+    );
+    for (const prediction of activePredictions) {
+      try {
+        const response = await axios.get(
+          `https://v3.football.api-sports.io/fixtures?id=${prediction.match_id}`,
+          { headers: { "x-apisports-key": process.env.FOOTBALL_API_KEY } }
+        );
+        const fixture = response.data.response[0];
+        if (!fixture) continue;
+        const status = fixture.fixture.status.short;
+        const isFinished = ["FT", "AET", "PEN"].includes(status);
+        if (isFinished) {
+          const homeGoals = fixture.goals.home;
+          const awayGoals = fixture.goals.away;
+          const totalGoals = homeGoals + awayGoals;
+          let result = null;
+          const predType = prediction.prediction_type.toUpperCase();
+          if (predType.includes("İY")) {
+            const htScore = fixture.score.halftime;
+            const htTotal = htScore.home + htScore.away;
+            if (predType.includes("0.5Ü")) result = htTotal > 0.5 ? "won" : "lost";
+            else if (predType.includes("1.5Ü")) result = htTotal > 1.5 ? "won" : "lost";
+            else if (predType.includes("2.5Ü")) result = htTotal > 2.5 ? "won" : "lost";
+          } else if (predType.includes("MB")) {
+            if (predType.includes("0.5Ü")) result = totalGoals > 0.5 ? "won" : "lost";
+            else if (predType.includes("1.5Ü")) result = totalGoals > 1.5 ? "won" : "lost";
+            else if (predType.includes("2.5Ü")) result = totalGoals > 2.5 ? "won" : "lost";
+            else if (predType.includes("3.5Ü")) result = totalGoals > 3.5 ? "won" : "lost";
+            else if (predType.includes("KGV")) result = homeGoals > 0 && awayGoals > 0 ? "won" : "lost";
+          }
+          if (result) {
+            await pool.query("UPDATE predictions SET result = $1, updated_at = NOW() WHERE id = $2", [result, prediction.id]);
+            console.log(`✅ Prediction #${prediction.id} updated: ${result.toUpperCase()}`);
+          }
+        }
+      } catch (err) {
+        console.error(`Error checking prediction #${prediction.id}:`, err.message);
+      }
+    }
+  } catch (error) {
+    console.error("Cron job error:", error.message);
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`🚀 FlashGoal API running on port ${PORT}`);
 });
