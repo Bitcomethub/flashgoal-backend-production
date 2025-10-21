@@ -349,13 +349,15 @@ cron.schedule("*/30 * * * * *", async () => {
         const status = fixture.fixture.status.short;
         const isFinished = ["FT", "AET", "PEN"].includes(status);
         if (isFinished) {
-          const homeGoals = fixture.goals.home;
-          const awayGoals = fixture.goals.away;
-          const totalGoals = homeGoals + awayGoals;
+        const status = fixture.fixture.status.short;
+        const isFinished = ["FT", "AET", "PEN"].includes(status);
+        const isHalfTimeOrLater = ["HT", "2H", "FT", "AET", "PEN"].includes(status);
+        const predType = prediction.prediction_type.toUpperCase();
+        const shouldCheck = predType.includes("İY") ? isHalfTimeOrLater : isFinished;
+        if (shouldCheck) {
           let result = null;
           const predType = prediction.prediction_type.toUpperCase();
           if (predType.includes("İY")) {
-            const htScore = fixture.score.halftime;
             const htTotal = htScore.home + htScore.away;
             if (predType.includes("0.5Ü")) result = htTotal > 0.5 ? "won" : "lost";
             else if (predType.includes("1.5Ü")) result = htTotal > 1.5 ? "won" : "lost";
