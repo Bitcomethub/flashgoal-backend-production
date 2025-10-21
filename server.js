@@ -58,7 +58,7 @@ app.get('/api/matches/live', async (req, res) => {
     const response = await axios.get('https://v3.football.api-sports.io/fixtures', {
       params: { live: 'all' },
       headers: {
-        'x-rapidapi-key': process.env.API_FOOTBALL_KEY,
+        'x-apisports-key': process.env.FOOTBALL_API_KEY,
         'x-rapidapi-host': 'v3.football.api-sports.io'
       }
     });
