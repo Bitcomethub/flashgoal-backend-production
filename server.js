@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
 const axios = require('axios');
+const cron = require("node-cron");
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -34,7 +35,7 @@ async function initDatabase() {
         prediction_type VARCHAR(100) NOT NULL,
         odds DECIMAL(5,2),
         confidence VARCHAR(50),
-        status VARCHAR(50) DEFAULT 'pending',
+        status VARCHAR(50) DEFAULT 'active',
         result VARCHAR(50),
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -108,7 +109,7 @@ app.get('/api/predictions', async (req, res) => {
 app.get('/api/predictions/active', async (req, res) => {
   try {
     const result = await pool.query(
-      "SELECT * FROM predictions WHERE status = 'pending' ORDER BY created_at DESC"
+      "SELECT * FROM predictions WHERE status = 'active' ORDER BY created_at DESC"
     );
     
     res.json({
@@ -121,6 +122,27 @@ app.get('/api/predictions/active', async (req, res) => {
     res.status(500).json({ 
       success: false, 
       error: 'Failed to fetch active predictions' 
+    });
+  }
+});
+
+// GET past predictions (won/lost)
+app.get('/api/predictions/past', async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT * FROM predictions WHERE status IN ('won', 'lost') ORDER BY updated_at DESC"
+    );
+    
+    res.json({
+      success: true,
+      count: result.rows.length,
+      predictions: result.rows
+    });
+  } catch (error) {
+    console.error('Get past predictions error:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Failed to fetch past predictions' 
     });
   }
 });
@@ -167,47 +189,6 @@ app.post('/api/predictions', async (req, res) => {
       confidence
     } = req.body;
 
-// Update prediction result
-app.put('/api/predictions/:id/result', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { result } = req.body;
-
-    if (!result || !['won', 'lost'].includes(result)) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'Result must be "won" or "lost"' 
-      });
-    }
-
-    const updateResult = await pool.query(
-      'UPDATE predictions SET result = $1, updated_at = NOW() WHERE id = $2 RETURNING *',
-      [result, id]
-    );
-
-    if (updateResult.rows.length === 0) {
-      return res.status(404).json({ 
-        success: false, 
-        error: 'Prediction not found' 
-      });
-    }
-
-    res.json({
-      success: true,
-      message: `Prediction marked as ${result}`,
-      prediction: updateResult.rows[0]
-    });
-  } catch (error) {
-    console.error('Update result error:', error);
-    res.status(500).json({ 
-      success: false, 
-      error: 'Failed to update prediction result' 
-    });
-  }
-});
-
-
-// Update prediction result
     // Validation
     if (!match_id || !home_team || !away_team || !prediction_type) {
       return res.status(400).json({
@@ -219,9 +200,9 @@ app.put('/api/predictions/:id/result', async (req, res) => {
     const result = await pool.query(
       `INSERT INTO predictions 
        (match_id, home_team, away_team, league, prediction_type, odds, confidence, status) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending') 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, 'active') 
        RETURNING *`,
-      [match_id, home_team, away_team, league, prediction_type, odds, confidence]
+      [match_id, home_team, away_team, league, prediction_type, odds || 0, confidence || 'medium']
     );
 
     res.status(201).json({
@@ -273,6 +254,45 @@ app.put('/api/predictions/:id', async (req, res) => {
   }
 });
 
+// Update prediction result
+app.put('/api/predictions/:id/result', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { result } = req.body;
+
+    if (!result || !['won', 'lost'].includes(result)) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Result must be "won" or "lost"' 
+      });
+    }
+
+    const updateResult = await pool.query(
+      'UPDATE predictions SET status = $1, result = $1, updated_at = NOW() WHERE id = $2 RETURNING *',
+      [result, id]
+    );
+
+    if (updateResult.rows.length === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'Prediction not found' 
+      });
+    }
+
+    res.json({
+      success: true,
+      message: `Prediction marked as ${result}`,
+      prediction: updateResult.rows[0]
+    });
+  } catch (error) {
+    console.error('Update result error:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Failed to update prediction result' 
+    });
+  }
+});
+
 // DELETE prediction
 app.delete('/api/predictions/:id', async (req, res) => {
   try {
@@ -318,6 +338,7 @@ app.get('/', (req, res) => {
       liveMatches: '/api/matches/live',
       predictions: '/api/predictions',
       activePredictions: '/api/predictions/active',
+      pastPredictions: '/api/predictions/past',
       createPrediction: 'POST /api/predictions',
       updatePrediction: 'PUT /api/predictions/:id',
       deletePrediction: 'DELETE /api/predictions/:id'
@@ -325,50 +346,84 @@ app.get('/', (req, res) => {
   });
 });
 
-
-// ============================================
-
 // ============================================
 // AUTOMATIC PREDICTION RESULT CHECKER (30s)
 // ============================================
-const cron = require("node-cron");
 
 cron.schedule("*/30 * * * * *", async () => {
   try {
     console.log("🔄 Checking predictions...");
-    const { rows: activePredictions } = await pool.query("SELECT * FROM predictions WHERE result IS NULL");
+    
+    // Sadece aktif tahminleri kontrol et
+    const { rows: activePredictions } = await pool.query(
+      "SELECT * FROM predictions WHERE status = 'active'"
+    );
+    
     for (const prediction of activePredictions) {
       try {
-        const response = await axios.get(`https://v3.football.api-sports.io/fixtures?id=${prediction.match_id}`, {
-          headers: { "x-apisports-key": process.env.FOOTBALL_API_KEY }
-        });
+        const response = await axios.get(
+          `https://v3.football.api-sports.io/fixtures?id=${prediction.match_id}`, 
+          {
+            headers: { "x-apisports-key": process.env.FOOTBALL_API_KEY }
+          }
+        );
+        
         const fixture = response.data.response[0];
         if (!fixture) continue;
+        
         const status = fixture.fixture.status.short;
         const predType = prediction.prediction_type.toUpperCase();
+        
         const isFinished = ["FT", "AET", "PEN"].includes(status);
         const isHalfTimeOrLater = ["HT", "2H", "FT", "AET", "PEN"].includes(status);
-        const shouldCheck = predType.includes("İY") || predType.includes("IY") ? isHalfTimeOrLater : isFinished;
+        
+        const shouldCheck = predType.includes("İY") || predType.includes("IY") 
+          ? isHalfTimeOrLater 
+          : isFinished;
+        
         if (shouldCheck) {
           const homeGoals = fixture.goals.home || 0;
           const awayGoals = fixture.goals.away || 0;
           const totalGoals = homeGoals + awayGoals;
+          
           const htScore = fixture.score.halftime;
           const htTotal = (htScore?.home || 0) + (htScore?.away || 0);
+          
           let result = null;
+          
+          // İY (İlk Yarı) tahminleri
           if (predType.includes("İY") || predType.includes("IY")) {
-            if (predType.includes("0.5Ü") || predType.includes("0.5U")) result = htTotal > 0.5 ? "won" : "lost";
-            else if (predType.includes("1.5Ü") || predType.includes("1.5U")) result = htTotal > 1.5 ? "won" : "lost";
-            else if (predType.includes("2.5Ü") || predType.includes("2.5U")) result = htTotal > 2.5 ? "won" : "lost";
-          } else if (predType.includes("MB")) {
-            if (predType.includes("0.5Ü") || predType.includes("0.5U")) result = totalGoals > 0.5 ? "won" : "lost";
-            else if (predType.includes("1.5Ü") || predType.includes("1.5U")) result = totalGoals > 1.5 ? "won" : "lost";
-            else if (predType.includes("2.5Ü") || predType.includes("2.5U")) result = totalGoals > 2.5 ? "won" : "lost";
-            else if (predType.includes("3.5Ü") || predType.includes("3.5U")) result = totalGoals > 3.5 ? "won" : "lost";
-            else if (predType.includes("KGV")) result = homeGoals > 0 && awayGoals > 0 ? "won" : "lost";
+            if (predType.includes("0.5Ü") || predType.includes("0.5U")) {
+              result = htTotal > 0.5 ? "won" : "lost";
+            } else if (predType.includes("1.5Ü") || predType.includes("1.5U")) {
+              result = htTotal > 1.5 ? "won" : "lost";
+            } else if (predType.includes("2.5Ü") || predType.includes("2.5U")) {
+              result = htTotal > 2.5 ? "won" : "lost";
+            }
+          } 
+          // MB (Maç Boyu) tahminleri
+          else if (predType.includes("MB")) {
+            if (predType.includes("0.5Ü") || predType.includes("0.5U")) {
+              result = totalGoals > 0.5 ? "won" : "lost";
+            } else if (predType.includes("1.5Ü") || predType.includes("1.5U")) {
+              result = totalGoals > 1.5 ? "won" : "lost";
+            } else if (predType.includes("2.5Ü") || predType.includes("2.5U")) {
+              result = totalGoals > 2.5 ? "won" : "lost";
+            } else if (predType.includes("3.5Ü") || predType.includes("3.5U")) {
+              result = totalGoals > 3.5 ? "won" : "lost";
+            } else if (predType.includes("4.5Ü") || predType.includes("4.5U")) {
+              result = totalGoals > 4.5 ? "won" : "lost";
+            } else if (predType.includes("KGV")) {
+              result = homeGoals > 0 && awayGoals > 0 ? "won" : "lost";
+            }
           }
+          
           if (result) {
-            await pool.query("UPDATE predictions SET result = $1, updated_at = NOW() WHERE id = $2", [result, prediction.id]);
+            // Status ve result'u birlikte güncelle
+            await pool.query(
+              "UPDATE predictions SET status = $1, result = $1, updated_at = NOW() WHERE id = $2", 
+              [result, prediction.id]
+            );
             console.log(`✅ Prediction #${prediction.id} updated: ${result.toUpperCase()}`);
           }
         }
@@ -378,6 +433,24 @@ cron.schedule("*/30 * * * * *", async () => {
     }
   } catch (error) {
     console.error("Cron job error:", error.message);
+  }
+});
+
+// ============================================
+// RESET PAST PREDICTIONS (Daily at 00:00)
+// ============================================
+
+cron.schedule("0 0 * * *", async () => {
+  try {
+    console.log("🗑️ Resetting past predictions...");
+    
+    const result = await pool.query(
+      "DELETE FROM predictions WHERE status IN ('won', 'lost') AND updated_at < NOW() - INTERVAL '1 day'"
+    );
+    
+    console.log(`✅ Deleted ${result.rowCount} old predictions`);
+  } catch (error) {
+    console.error("Reset predictions error:", error.message);
   }
 });
 
