@@ -81,6 +81,62 @@ app.get('/api/matches/live', async (req, res) => {
 });
 
 // ============================================
+// ODDS API
+// ============================================
+
+// GET odds for a specific match
+app.get('/api/odds/:match_id', async (req, res) => {
+  try {
+    const { match_id } = req.params;
+    
+    const response = await axios.get('https://v3.football.api-sports.io/odds/live', {
+      params: { fixture: match_id },
+      headers: {
+        'x-apisports-key': process.env.FOOTBALL_API_KEY,
+        'x-rapidapi-host': 'v3.football.api-sports.io'
+      }
+    });
+
+    const data = response.data.response[0];
+    
+    if (!data || !data.bookmakers || data.bookmakers.length === 0) {
+      return res.json({
+        success: true,
+        odds: null,
+        message: 'No odds available for this match'
+      });
+    }
+
+    // İlk bookmaker'ı al (genelde en güvenilir)
+    const bookmaker = data.bookmakers[0];
+    
+    // Over/Under oranlarını bul
+    const overUnder = bookmaker.bets.find(bet => bet.name === 'Goals Over/Under');
+    
+    // Parsed odds object
+    const parsedOdds = {
+      bookmaker: bookmaker.name,
+      overUnder: overUnder ? overUnder.values.map(v => ({
+        value: v.value, // "0.5", "1.5", "2.5" vs.
+        over: parseFloat(v.odd), // Over oranı
+        under: v.under ? parseFloat(v.under) : null // Under oranı (varsa)
+      })) : []
+    };
+
+    res.json({
+      success: true,
+      odds: parsedOdds
+    });
+  } catch (error) {
+    console.error('Get odds error:', error.message);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Failed to fetch odds' 
+    });
+  }
+});
+
+// ============================================
 // PREDICTIONS API
 // ============================================
 
