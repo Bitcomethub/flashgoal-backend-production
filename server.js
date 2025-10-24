@@ -18,11 +18,12 @@ const pool = new Pool({
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
 });
 
-async function initDatabase() {
+async function runMigrations() {
   try {
     await pool.query('SELECT NOW()');
     console.log('✅ Database connected successfully');
     
+    // Predictions table
     await pool.query(`
       CREATE TABLE IF NOT EXISTS predictions (
         id SERIAL PRIMARY KEY,
@@ -43,30 +44,64 @@ async function initDatabase() {
     `);
     console.log('✅ Predictions table ready');
     
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS pending_predictions (
-        id SERIAL PRIMARY KEY,
-        button_name VARCHAR(50),
-        home_team VARCHAR(100) NOT NULL,
-        away_team VARCHAR(100) NOT NULL,
-        league VARCHAR(100),
-        current_minute INT,
-        home_score INT DEFAULT 0,
-        away_score INT DEFAULT 0,
-        prediction_text VARCHAR(200),
-        suggested_odds DECIMAL(5,2),
-        is_urgent BOOLEAN DEFAULT FALSE,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    // Pending predictions table - with migration support
+    const tableExists = await pool.query(`
+      SELECT EXISTS (
+        SELECT FROM information_schema.tables 
+        WHERE table_name = 'pending_predictions'
       )
     `);
-    console.log('✅ Pending predictions table ready');
+    
+    if (!tableExists.rows[0].exists) {
+      // Create new table
+      await pool.query(`
+        CREATE TABLE pending_predictions (
+          id SERIAL PRIMARY KEY,
+          button_name VARCHAR(50),
+          home_team VARCHAR(100) NOT NULL,
+          away_team VARCHAR(100) NOT NULL,
+          league VARCHAR(100),
+          current_minute INT,
+          home_score INT DEFAULT 0,
+          away_score INT DEFAULT 0,
+          prediction_text VARCHAR(200),
+          suggested_odds DECIMAL(5,2),
+          is_urgent BOOLEAN DEFAULT FALSE,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+      `);
+      console.log('✅ Pending predictions table created');
+    } else {
+      // Add missing columns if table exists
+      const columns = [
+        { name: 'button_name', type: 'VARCHAR(50)' },
+        { name: 'home_score', type: 'INT DEFAULT 0' },
+        { name: 'away_score', type: 'INT DEFAULT 0' },
+        { name: 'prediction_text', type: 'VARCHAR(200)' },
+        { name: 'suggested_odds', type: 'DECIMAL(5,2)' },
+        { name: 'is_urgent', type: 'BOOLEAN DEFAULT FALSE' },
+      ];
+      
+      for (const col of columns) {
+        try {
+          await pool.query(`
+            ALTER TABLE pending_predictions 
+            ADD COLUMN IF NOT EXISTS ${col.name} ${col.type}
+          `);
+        } catch (err) {
+          // Column already exists, ignore
+        }
+      }
+      console.log('✅ Pending predictions table migrated');
+    }
     
   } catch (error) {
-    console.error('❌ Database error:', error);
+    console.error('❌ Database migration error:', error);
+    throw error;
   }
 }
 
-initDatabase();
+runMigrations();
 
 const BUTTON_CONFIG = {
   'FHGfinder': { base: 'İY', addGoals: 1, urgent: false },
@@ -86,13 +121,19 @@ function calculateOdds(totalGoals, addGoals) {
   if (target <= 2.5) return 2.00;
   if (target <= 3.5) return 2.25;
   if (target <= 4.5) return 2.50;
+  if (target <= 5.5) return 2.75;
   return 3.00;
 }
 
 function parseTelegramMessage(text) {
   try {
-    const buttonMatch = text.match(/The Button (\w+) has matched/);
+    const buttonMatch = text.match(/The Button (\w+) has matched/i);
     const button = buttonMatch ? buttonMatch[1] : null;
+    
+    if (!button || !BUTTON_CONFIG[button]) {
+      console.log('⚠️ Unknown button:', button);
+      return null;
+    }
     
     const lines = text.split('\n');
     const matchLine = lines.find(line => line.includes('V') || line.includes('vs'));
@@ -106,6 +147,11 @@ function parseTelegramMessage(text) {
         homeTeam = teams[0].trim();
         awayTeam = teams[1].trim();
       }
+    }
+    
+    if (!homeTeam || !awayTeam) {
+      console.log('⚠️ Could not parse teams');
+      return null;
     }
     
     const leagueLine = lines.find(line => line.includes(':-') || line.includes('League'));
@@ -123,7 +169,7 @@ function parseTelegramMessage(text) {
     const awayScore = scoreMatch ? parseInt(scoreMatch[2]) : 0;
     const totalGoals = homeScore + awayScore;
     
-    const config = BUTTON_CONFIG[button] || { base: 'MB', addGoals: 1, urgent: false };
+    const config = BUTTON_CONFIG[button];
     
     let predictionText = '';
     if (config.base === 'KGV') {
@@ -148,7 +194,7 @@ function parseTelegramMessage(text) {
       urgent: config.urgent,
     };
   } catch (error) {
-    console.error('Parse error:', error);
+    console.error('❌ Parse error:', error);
     return null;
   }
 }
@@ -165,9 +211,9 @@ app.post('/api/telegram/webhook', async (req, res) => {
     
     const parsed = parseTelegramMessage(message);
     
-    if (!parsed || !parsed.homeTeam || !parsed.awayTeam) {
-      console.error('❌ Parse failed');
-      return res.sendStatus(400);
+    if (!parsed) {
+      console.log('⚠️ Parse failed, skipping');
+      return res.sendStatus(200);
     }
     
     await pool.query(
@@ -204,7 +250,7 @@ app.get('/api/predictions/pending', async (req, res) => {
     );
     res.json({ success: true, predictions: result.rows });
   } catch (error) {
-    console.error('Error fetching pending:', error);
+    console.error('❌ Error fetching pending:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
@@ -252,7 +298,7 @@ app.post('/api/predictions/pending/:id/approve', async (req, res) => {
     console.log('✅ Prediction approved:', pred.home_team, 'vs', pred.away_team);
     res.json({ success: true });
   } catch (error) {
-    console.error('Error approving:', error);
+    console.error('❌ Error approving:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
@@ -264,7 +310,7 @@ app.delete('/api/predictions/pending/:id', async (req, res) => {
     console.log('❌ Prediction rejected:', id);
     res.json({ success: true });
   } catch (error) {
-    console.error('Error rejecting:', error);
+    console.error('❌ Error rejecting:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
@@ -282,7 +328,7 @@ app.get('/api/matches/live', async (req, res) => {
     const matches = response.data.response;
     res.json({ success: true, count: matches.length, matches: matches });
   } catch (error) {
-    console.error('Live matches error:', error.message);
+    console.error('❌ Live matches error:', error.message);
     res.status(500).json({ success: false, error: 'Failed to fetch live matches' });
   }
 });
@@ -292,7 +338,7 @@ app.get('/api/predictions', async (req, res) => {
     const result = await pool.query('SELECT * FROM predictions ORDER BY created_at DESC');
     res.json({ success: true, count: result.rows.length, predictions: result.rows });
   } catch (error) {
-    console.error('Get predictions error:', error);
+    console.error('❌ Get predictions error:', error);
     res.status(500).json({ success: false, error: 'Failed to fetch predictions' });
   }
 });
@@ -315,19 +361,34 @@ app.post('/api/predictions', async (req, res) => {
 
     res.status(201).json({ success: true, prediction: result.rows[0] });
   } catch (error) {
-    console.error('Create prediction error:', error);
+    console.error('❌ Create prediction error:', error);
     res.status(500).json({ success: false, error: 'Failed to create prediction' });
   }
 });
 
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+app.get('/health', async (req, res) => {
+  try {
+    await pool.query('SELECT 1');
+    res.json({ 
+      status: 'ok', 
+      timestamp: new Date().toISOString(),
+      database: 'connected'
+    });
+  } catch (error) {
+    res.status(503).json({ 
+      status: 'error', 
+      timestamp: new Date().toISOString(),
+      database: 'disconnected',
+      error: error.message
+    });
+  }
 });
 
 app.get('/', (req, res) => {
   res.json({
     name: 'FlashGoal API',
-    version: '2.0.0',
+    version: '3.0.0-production',
+    status: 'rock-solid',
     endpoints: {
       health: '/health',
       liveMatches: '/api/matches/live',
@@ -346,7 +407,10 @@ cron.schedule("*/30 * * * * *", async () => {
       try {
         const response = await axios.get(
           `https://v3.football.api-sports.io/fixtures?id=${prediction.match_id}`, 
-          { headers: { "x-apisports-key": process.env.FOOTBALL_API_KEY } }
+          { 
+            headers: { "x-apisports-key": process.env.FOOTBALL_API_KEY },
+            timeout: 5000
+          }
         );
         
         const fixture = response.data.response[0];
@@ -392,14 +456,14 @@ cron.schedule("*/30 * * * * *", async () => {
           }
         }
       } catch (err) {
-        console.error(`Error checking prediction #${prediction.id}:`, err.message);
+        console.error(`❌ Error checking prediction #${prediction.id}:`, err.message);
       }
     }
   } catch (error) {
-    console.error("Cron job error:", error.message);
+    console.error("❌ Cron job error:", error.message);
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 FlashGoal API v2.0 running on port ${PORT}`);
+  console.log(`🚀 FlashGoal API v3.0 PRODUCTION running on port ${PORT}`);
 });
