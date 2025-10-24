@@ -23,7 +23,6 @@ async function runMigrations() {
     await pool.query('SELECT NOW()');
     console.log('✅ Database connected successfully');
     
-    // Predictions table
     await pool.query(`
       CREATE TABLE IF NOT EXISTS predictions (
         id SERIAL PRIMARY KEY,
@@ -44,7 +43,6 @@ async function runMigrations() {
     `);
     console.log('✅ Predictions table ready');
     
-    // Pending predictions table - with migration support
     const tableExists = await pool.query(`
       SELECT EXISTS (
         SELECT FROM information_schema.tables 
@@ -53,7 +51,6 @@ async function runMigrations() {
     `);
     
     if (!tableExists.rows[0].exists) {
-      // Create new table
       await pool.query(`
         CREATE TABLE pending_predictions (
           id SERIAL PRIMARY KEY,
@@ -72,7 +69,6 @@ async function runMigrations() {
       `);
       console.log('✅ Pending predictions table created');
     } else {
-      // Add missing columns if table exists
       const columns = [
         { name: 'button_name', type: 'VARCHAR(50)' },
         { name: 'home_score', type: 'INT DEFAULT 0' },
@@ -89,10 +85,20 @@ async function runMigrations() {
             ADD COLUMN IF NOT EXISTS ${col.name} ${col.type}
           `);
         } catch (err) {
-          // Column already exists, ignore
+          // Column already exists
         }
       }
       console.log('✅ Pending predictions table migrated');
+      
+      // Clean up old invalid records
+      const deleted = await pool.query(`
+        DELETE FROM pending_predictions 
+        WHERE suggested_odds IS NULL 
+           OR button_name IS NULL
+      `);
+      if (deleted.rowCount > 0) {
+        console.log(`🧹 Cleaned up ${deleted.rowCount} invalid pending predictions`);
+      }
     }
     
   } catch (error) {
@@ -243,6 +249,27 @@ app.post('/api/telegram/webhook', async (req, res) => {
   }
 });
 
+app.post('/api/cleanup/pending', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      DELETE FROM pending_predictions 
+      WHERE suggested_odds IS NULL 
+         OR button_name IS NULL
+    `);
+    
+    console.log(`🧹 Cleanup: Deleted ${result.rowCount} invalid pending predictions`);
+    
+    res.json({ 
+      success: true, 
+      deleted: result.rowCount,
+      message: `Cleaned up ${result.rowCount} invalid records`
+    });
+  } catch (error) {
+    console.error('❌ Cleanup error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 app.get('/api/predictions/pending', async (req, res) => {
   try {
     const result = await pool.query(
@@ -387,7 +414,7 @@ app.get('/health', async (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     name: 'FlashGoal API',
-    version: '3.0.0-production',
+    version: '3.1.0-production',
     status: 'rock-solid',
     endpoints: {
       health: '/health',
@@ -395,6 +422,7 @@ app.get('/', (req, res) => {
       predictions: '/api/predictions',
       pendingPredictions: '/api/predictions/pending',
       telegramWebhook: 'POST /api/telegram/webhook',
+      cleanup: 'POST /api/cleanup/pending'
     }
   });
 });
@@ -465,5 +493,5 @@ cron.schedule("*/30 * * * * *", async () => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 FlashGoal API v3.0 PRODUCTION running on port ${PORT}`);
+  console.log(`🚀 FlashGoal API v3.1 PRODUCTION running on port ${PORT}`);
 });
