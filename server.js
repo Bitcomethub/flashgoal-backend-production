@@ -8,6 +8,9 @@ const cron = require("node-cron");
 const app = express();
 const PORT = process.env.PORT || 8080;
 
+// Telegram Bot Token
+const TELEGRAM_BOT_TOKEN = '8424896876:AAE7CmmCyLfQkpz31pXVmNyTnb_0hWP_Veg';
+
 // Middleware
 app.use(cors());
 app.use(express.json());
@@ -33,6 +36,8 @@ async function initDatabase() {
         away_team VARCHAR(255) NOT NULL,
         league VARCHAR(255),
         prediction_type VARCHAR(100) NOT NULL,
+        team_type VARCHAR(50),
+        current_minute INT,
         odds DECIMAL(5,2),
         confidence VARCHAR(50),
         status VARCHAR(50) DEFAULT 'active',
@@ -43,12 +48,202 @@ async function initDatabase() {
     `);
     console.log('✅ Predictions table ready');
     
+    // Create pending predictions table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS pending_predictions (
+        id SERIAL PRIMARY KEY,
+        button_name VARCHAR(50),
+        home_team VARCHAR(100) NOT NULL,
+        away_team VARCHAR(100) NOT NULL,
+        league VARCHAR(100),
+        current_minute INT,
+        home_score INT DEFAULT 0,
+        away_score INT DEFAULT 0,
+        prediction_text VARCHAR(200),
+        is_urgent BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    console.log('✅ Pending predictions table ready');
+    
   } catch (error) {
     console.error('❌ Database error:', error);
   }
 }
 
 initDatabase();
+
+// ============================================
+// TELEGRAM WEBHOOK SYSTEM
+// ============================================
+
+function parseTelegramMessage(text) {
+  try {
+    const lines = text.split('\n');
+    
+    const buttonMatch = text.match(/The Button (\w+) has matched/);
+    const button = buttonMatch ? buttonMatch[1] : null;
+    
+    const matchLine = lines.find(line => line.includes('V'));
+    let homeTeam = '';
+    let awayTeam = '';
+    if (matchLine) {
+      const teams = matchLine.split('V');
+      homeTeam = teams[0].replace(/\(\d+\)/g, '').trim();
+      awayTeam = teams[1].replace(/\(\d+\)/g, '').trim();
+    }
+    
+    const leagueLine = lines.find(line => line.includes(':-'));
+    const league = leagueLine ? leagueLine.split(':-')[1].trim() : 'Unknown';
+    
+    const timeMatch = text.match(/Elapsed Time: (\d+)'/);
+    const elapsed = timeMatch ? parseInt(timeMatch[1]) : 0;
+    
+    const scoreMatch = text.match(/Score: (\d+)\s*-\s*(\d+)/);
+    const homeScore = scoreMatch ? parseInt(scoreMatch[1]) : 0;
+    const awayScore = scoreMatch ? parseInt(scoreMatch[2]) : 0;
+    
+    const buttonConfig = {
+      'FHGfinder': { prediction: 'İlk yarı 1 gol', urgent: false },
+      'LastMinGoal': { prediction: 'Son dakika 1 gol', urgent: true },
+      'LayDraw75': { prediction: '75+ 1 gol', urgent: false },
+      'BTTSactive': { prediction: 'KGV veya 1 gol', urgent: false },
+      'MikeFH1goal': { prediction: 'İlk yarı ilk gol', urgent: false },
+      'GoalStorm': { prediction: '1 gol daha', urgent: false },
+      'MidO15': { prediction: '1.5Ü', urgent: true },
+      'FHFlow': { prediction: 'İlk yarı devam 1 gol', urgent: true },
+    };
+    
+    const config = buttonConfig[button] || { prediction: '1 gol', urgent: false };
+    
+    return {
+      button,
+      homeTeam,
+      awayTeam,
+      league,
+      elapsed,
+      homeScore,
+      awayScore,
+      predictionText: config.prediction,
+      urgent: config.urgent,
+    };
+  } catch (error) {
+    console.error('Parse error:', error);
+    return null;
+  }
+}
+
+app.post('/api/telegram/webhook', async (req, res) => {
+  try {
+    const message = req.body?.message?.text;
+    
+    if (!message || !message.includes('The Button')) {
+      return res.sendStatus(200);
+    }
+    
+    console.log('📨 Telegram webhook received');
+    
+    const parsed = parseTelegramMessage(message);
+    
+    if (!parsed || !parsed.homeTeam || !parsed.awayTeam) {
+      console.error('❌ Parse failed');
+      return res.sendStatus(400);
+    }
+    
+    await pool.query(
+      `INSERT INTO pending_predictions 
+       (button_name, home_team, away_team, league, current_minute, 
+        home_score, away_score, prediction_text, is_urgent)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      [
+        parsed.button,
+        parsed.homeTeam,
+        parsed.awayTeam,
+        parsed.league,
+        parsed.elapsed,
+        parsed.homeScore,
+        parsed.awayScore,
+        parsed.predictionText,
+        parsed.urgent,
+      ]
+    );
+    
+    console.log('✅ Pending prediction added:', parsed.homeTeam, 'vs', parsed.awayTeam);
+    res.sendStatus(200);
+  } catch (error) {
+    console.error('❌ Webhook error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.get('/api/predictions/pending', async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT * FROM pending_predictions ORDER BY created_at DESC'
+    );
+    res.json({ success: true, predictions: result.rows });
+  } catch (error) {
+    console.error('Error fetching pending:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/predictions/pending/:id/approve', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { match_id, prediction_type, team_type, odds, confidence } = req.body;
+    
+    const pending = await pool.query(
+      'SELECT * FROM pending_predictions WHERE id = $1',
+      [id]
+    );
+    
+    if (pending.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Not found' });
+    }
+    
+    const pred = pending.rows[0];
+    
+    await pool.query(
+      `INSERT INTO predictions 
+       (match_id, home_team, away_team, league, prediction_type, 
+        team_type, odds, confidence, current_minute, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'active')`,
+      [
+        match_id,
+        pred.home_team,
+        pred.away_team,
+        pred.league,
+        prediction_type,
+        team_type,
+        odds,
+        confidence,
+        pred.current_minute,
+      ]
+    );
+    
+    await pool.query('DELETE FROM pending_predictions WHERE id = $1', [id]);
+    
+    console.log('✅ Prediction approved:', pred.home_team, 'vs', pred.away_team);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error approving:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.delete('/api/predictions/pending/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    await pool.query('DELETE FROM pending_predictions WHERE id = $1', [id]);
+    console.log('❌ Prediction rejected:', id);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error rejecting:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 
 // ============================================
 // LIVE MATCHES API
@@ -84,7 +279,6 @@ app.get('/api/matches/live', async (req, res) => {
 // ODDS API
 // ============================================
 
-// GET odds for a specific match
 app.get('/api/odds/:match_id', async (req, res) => {
   try {
     const { match_id } = req.params;
@@ -107,19 +301,15 @@ app.get('/api/odds/:match_id', async (req, res) => {
       });
     }
 
-    // İlk bookmaker'ı al (genelde en güvenilir)
     const bookmaker = data.bookmakers[0];
-    
-    // Over/Under oranlarını bul
     const overUnder = bookmaker.bets.find(bet => bet.name === 'Goals Over/Under');
     
-    // Parsed odds object
     const parsedOdds = {
       bookmaker: bookmaker.name,
       overUnder: overUnder ? overUnder.values.map(v => ({
-        value: v.value, // "0.5", "1.5", "2.5" vs.
-        over: parseFloat(v.odd), // Over oranı
-        under: v.under ? parseFloat(v.under) : null // Under oranı (varsa)
+        value: v.value,
+        over: parseFloat(v.odd),
+        under: v.under ? parseFloat(v.under) : null
       })) : []
     };
 
@@ -140,7 +330,6 @@ app.get('/api/odds/:match_id', async (req, res) => {
 // PREDICTIONS API
 // ============================================
 
-// GET all predictions
 app.get('/api/predictions', async (req, res) => {
   try {
     const result = await pool.query(
@@ -161,7 +350,6 @@ app.get('/api/predictions', async (req, res) => {
   }
 });
 
-// GET active predictions only
 app.get('/api/predictions/active', async (req, res) => {
   try {
     const result = await pool.query(
@@ -182,7 +370,6 @@ app.get('/api/predictions/active', async (req, res) => {
   }
 });
 
-// GET past predictions (won/lost)
 app.get('/api/predictions/past', async (req, res) => {
   try {
     const result = await pool.query(
@@ -203,7 +390,6 @@ app.get('/api/predictions/past', async (req, res) => {
   }
 });
 
-// GET prediction by ID
 app.get('/api/predictions/:id', async (req, res) => {
   try {
     const { id } = req.params;
@@ -232,7 +418,6 @@ app.get('/api/predictions/:id', async (req, res) => {
   }
 });
 
-// POST create new prediction
 app.post('/api/predictions', async (req, res) => {
   try {
     const {
@@ -245,7 +430,6 @@ app.post('/api/predictions', async (req, res) => {
       confidence
     } = req.body;
 
-    // Validation
     if (!match_id || !home_team || !away_team || !prediction_type) {
       return res.status(400).json({
         success: false,
@@ -275,7 +459,6 @@ app.post('/api/predictions', async (req, res) => {
   }
 });
 
-// PUT update prediction
 app.put('/api/predictions/:id', async (req, res) => {
   try {
     const { id } = req.params;
@@ -310,7 +493,6 @@ app.put('/api/predictions/:id', async (req, res) => {
   }
 });
 
-// Update prediction result
 app.put('/api/predictions/:id/result', async (req, res) => {
   try {
     const { id } = req.params;
@@ -349,7 +531,6 @@ app.put('/api/predictions/:id/result', async (req, res) => {
   }
 });
 
-// DELETE prediction
 app.delete('/api/predictions/:id', async (req, res) => {
   try {
     const { id } = req.params;
@@ -379,12 +560,10 @@ app.delete('/api/predictions/:id', async (req, res) => {
   }
 });
 
-// Health check
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// Root endpoint
 app.get('/', (req, res) => {
   res.json({
     name: 'FlashGoal API',
@@ -395,6 +574,8 @@ app.get('/', (req, res) => {
       predictions: '/api/predictions',
       activePredictions: '/api/predictions/active',
       pastPredictions: '/api/predictions/past',
+      pendingPredictions: '/api/predictions/pending',
+      telegramWebhook: 'POST /api/telegram/webhook',
       createPrediction: 'POST /api/predictions',
       updatePrediction: 'PUT /api/predictions/:id',
       deletePrediction: 'DELETE /api/predictions/:id'
@@ -402,15 +583,13 @@ app.get('/', (req, res) => {
   });
 });
 
+
 // ============================================
-// AUTOMATIC PREDICTION RESULT CHECKER (30s)
+// CRON JOBS
 // ============================================
 
 cron.schedule("*/30 * * * * *", async () => {
   try {
-    console.log("🔄 Checking predictions...");
-    
-    // Sadece aktif tahminleri kontrol et
     const { rows: activePredictions } = await pool.query(
       "SELECT * FROM predictions WHERE status = 'active'"
     );
@@ -447,7 +626,6 @@ cron.schedule("*/30 * * * * *", async () => {
           
           let result = null;
           
-          // İY (İlk Yarı) tahminleri
           if (predType.includes("İY") || predType.includes("IY")) {
             if (predType.includes("0.5Ü") || predType.includes("0.5U")) {
               result = htTotal > 0.5 ? "won" : "lost";
@@ -457,7 +635,6 @@ cron.schedule("*/30 * * * * *", async () => {
               result = htTotal > 2.5 ? "won" : "lost";
             }
           } 
-          // MB (Maç Boyu) tahminleri
           else if (predType.includes("MB")) {
             if (predType.includes("0.5Ü") || predType.includes("0.5U")) {
               result = totalGoals > 0.5 ? "won" : "lost";
@@ -475,7 +652,6 @@ cron.schedule("*/30 * * * * *", async () => {
           }
           
           if (result) {
-            // Status ve result'u birlikte güncelle
             await pool.query(
               "UPDATE predictions SET status = $1, result = $1, updated_at = NOW() WHERE id = $2", 
               [result, prediction.id]
@@ -491,10 +667,6 @@ cron.schedule("*/30 * * * * *", async () => {
     console.error("Cron job error:", error.message);
   }
 });
-
-// ============================================
-// RESET PAST PREDICTIONS (Daily at 00:00)
-// ============================================
 
 cron.schedule("0 0 * * *", async () => {
   try {
