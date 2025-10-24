@@ -1,0 +1,73 @@
+
+// ==========================================
+// REVENUECAT WEBHOOK
+// ==========================================
+
+app.post("/api/webhook/revenuecat", async (req, res) => {
+  try {
+    const event = req.body;
+    
+    console.log("🔔 RevenueCat webhook:", event.type);
+    
+    if (event.type === "INITIAL_PURCHASE" || event.type === "RENEWAL") {
+      const userId = event.app_user_id;
+      const productId = event.product_id;
+      
+      if (productId === "com.flashgoal.vip.24h") {
+        const expiryDate = new Date();
+        expiryDate.setHours(expiryDate.getHours() + 24);
+        
+        await pool.query(
+          `INSERT INTO vip_access (user_id, expiry_date, product_id) 
+           VALUES ($1, $2, $3)
+           ON CONFLICT (user_id) 
+           DO UPDATE SET expiry_date = $2, product_id = $3, updated_at = NOW()`,
+          [userId, expiryDate, productId]
+        );
+        
+        console.log(`✅ 24h VIP activated for user: ${userId}`);
+      } else {
+        const expiryDate = new Date(event.expiration_at_ms);
+        
+        await pool.query(
+          `INSERT INTO vip_access (user_id, expiry_date, product_id) 
+           VALUES ($1, $2, $3)
+           ON CONFLICT (user_id) 
+           DO UPDATE SET expiry_date = $2, product_id = $3, updated_at = NOW()`,
+          [userId, expiryDate, productId]
+        );
+        
+        console.log(`✅ Subscription activated for user: ${userId}`);
+      }
+    }
+    
+    res.status(200).send("OK");
+  } catch (error) {
+    console.error("❌ Webhook error:", error);
+    res.status(500).send("Error");
+  }
+});
+
+app.get("/api/vip/check/:userId", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    
+    const result = await pool.query(
+      `SELECT * FROM vip_access WHERE user_id = $1 AND expiry_date > NOW()`,
+      [userId]
+    );
+    
+    const isVIP = result.rows.length > 0;
+    const expiryDate = isVIP ? result.rows[0].expiry_date : null;
+    
+    res.json({ 
+      success: true, 
+      isVIP, 
+      expiryDate,
+      productId: isVIP ? result.rows[0].product_id : null
+    });
+  } catch (error) {
+    console.error("Error checking VIP:", error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
