@@ -41,6 +41,22 @@ async function initDatabase() {
     `);
     console.log('✅ Table ready');
     
+    // Create vip_access table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS vip_access (
+        id SERIAL PRIMARY KEY,
+        user_id VARCHAR(255) UNIQUE NOT NULL,
+        expiry_date TIMESTAMP NOT NULL,
+        product_id VARCHAR(255) NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_vip_user ON vip_access(user_id)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_vip_expiry ON vip_access(expiry_date)`);
+    console.log('✅ VIP access table ready');
+    
     await pool.query('DROP TABLE IF EXISTS pending_predictions CASCADE');
     console.log('🗑️ Cleaned');
     
