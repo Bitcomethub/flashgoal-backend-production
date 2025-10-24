@@ -51,6 +51,42 @@ async function initDatabase() {
 
 initDatabase();
 
+// CLEANUP ENDPOINT - Delete old predictions
+app.post('/api/cleanup', async (req, res) => {
+  try {
+    // Delete predictions older than 2 days
+    const result = await pool.query(
+      `DELETE FROM predictions 
+       WHERE created_at < NOW() - INTERVAL '2 days' 
+       RETURNING id`
+    );
+    
+    res.json({ 
+      success: true, 
+      message: `Deleted ${result.rowCount} old predictions`,
+      count: result.rowCount 
+    });
+  } catch (error) {
+    console.error('❌ Cleanup error:', error);
+    res.status(500).json({ success: false, error: 'Cleanup failed' });
+  }
+});
+
+// DELETE ALL PREDICTIONS (dangerous - use carefully)
+app.delete('/api/predictions/all', async (req, res) => {
+  try {
+    const result = await pool.query('DELETE FROM predictions RETURNING id');
+    res.json({ 
+      success: true, 
+      message: `Deleted all ${result.rowCount} predictions`,
+      count: result.rowCount 
+    });
+  } catch (error) {
+    console.error('❌ Delete all error:', error);
+    res.status(500).json({ success: false, error: 'Delete failed' });
+  }
+});
+
 app.get('/api/matches/live', async (req, res) => {
   try {
     const response = await axios.get('https://v3.football.api-sports.io/fixtures', {
@@ -153,9 +189,23 @@ app.get('/health', async (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     name: 'FlashGoal API',
-    version: '5.0.0-final',
+    version: '5.1.0-cleanup',
     status: 'production'
   });
+});
+
+// Auto cleanup cron - every day at 3 AM
+cron.schedule("0 3 * * *", async () => {
+  try {
+    const result = await pool.query(
+      `DELETE FROM predictions 
+       WHERE created_at < NOW() - INTERVAL '2 days' 
+       RETURNING id`
+    );
+    console.log(`🗑️ Auto cleanup: Deleted ${result.rowCount} old predictions`);
+  } catch (error) {
+    console.error("❌ Auto cleanup error:", error.message);
+  }
 });
 
 cron.schedule("*/30 * * * * *", async () => {
@@ -225,5 +275,5 @@ cron.schedule("*/30 * * * * *", async () => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 FlashGoal API v5.0 FINAL - Port ${PORT}`);
+  console.log(`🚀 FlashGoal API v5.1 - Port ${PORT}`);
 });
