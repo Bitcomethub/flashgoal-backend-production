@@ -363,6 +363,34 @@ if (process.env.STRIPE_SECRET_KEY) {
 }
 // Create payment intent
 app.post('/api/payments/create-intent', async (req, res) => {
+  console.log('🟢 ONE-TIME PAYMENT!');
+  console.log('Body:', req.body);
+
+  try {
+    const { priceId, userId, email } = req.body;
+    
+    if (!priceId || !email) {
+      return res.status(400).json({ success: false, error: 'Missing fields' });
+    }
+    
+    const session = await stripe.checkout.sessions.create({
+      mode: 'payment',
+      line_items: [{ price: priceId, quantity: 1 }],
+      success_url: 'https://app.flashgoal.app/user/success?session_id={CHECKOUT_SESSION_ID}',
+      cancel_url: 'https://app.flashgoal.app/user/vip',
+      customer_email: email,
+      metadata: { userId: userId || 'unknown', type: 'one-time' }
+    });
+
+    console.log('✅ Session:', session.id);
+    res.json({ success: true, url: session.url, sessionId: session.id });
+
+  } catch (error) {
+    console.error('❌ Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // Subscription endpoint
 app.post('/api/payments/create-subscription', async (req, res) => {
   console.log('🔵 ENDPOINT HIT!');
@@ -398,28 +426,6 @@ app.post('/api/payments/create-subscription', async (req, res) => {
     
   } catch (error) {
     console.error('Error:', error.message);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-  try {
-    const { amount, currency = 'try', userId, productId } = req.body;
-
-    const paymentIntent = await stripe.paymentIntents.create({
-      amount: amount * 100, // Stripe uses cents
-      currency: currency,
-      metadata: {
-        userId: userId,
-        productId: productId
-      }
-    });
-
-    res.json({ 
-      success: true, 
-      clientSecret: paymentIntent.client_secret,
-      paymentIntentId: paymentIntent.id
-    });
-  } catch (error) {
-    console.error('Payment intent error:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
