@@ -375,30 +375,25 @@ app.post('/api/payments/create-subscription', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Missing required fields' });
     }
     
-    let customer;
-    const existingCustomers = await stripe.customers.list({ email, limit: 1 });
-    
-    if (existingCustomers.data.length > 0) {
-      customer = existingCustomers.data[0];
-    } else {
-      customer = await stripe.customers.create({ email, metadata: { userId } });
-    }
-    
-    const subscription = await stripe.subscriptions.create({
-      customer: customer.id,
-      items: [{ price: priceId }],
-      payment_behavior: 'default_incomplete',
-      payment_settings: { save_default_payment_method: 'on_subscription' },
-      expand: ['latest_invoice.payment_intent'],
+    const session = await stripe.checkout.sessions.create({
+      mode: 'subscription',
+      line_items: [{
+        price: priceId,
+        quantity: 1,
+      }],
+      success_url: 'https://app.flashgoal.app/user/success?session_id={CHECKOUT_SESSION_ID}',
+      cancel_url: 'https://app.flashgoal.app/user/vip',
+      customer_email: email,
+      metadata: {
+        userId: userId || 'unknown'
+      }
     });
-    
-    const clientSecret = subscription.latest_invoice.payment_intent.client_secret;
+
+    console.log('✅ Checkout Session created:', session.id);
     
     res.json({
       success: true,
-      clientSecret,
-      subscriptionId: subscription.id,
-      customerId: customer.id
+      url: session.url
     });
     
   } catch (error) {
