@@ -422,7 +422,11 @@ app.get("/api/vip/check/:userId", async (req, res) => {
 cron.schedule('*/10 * * * *', async () => {
   console.log('🕐 Running cron job - updating match scores...');
   try {
-    const response = await fetch(`${process.env.RAILWAY_PUBLIC_DOMAIN || 'http://localhost:3000'}/api/cron/update-scores`);
+    const apiUrl = process.env.RAILWAY_PUBLIC_DOMAIN 
+      ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}/api/cron/update-scores`
+      : 'http://localhost:3000/api/cron/update-scores';
+    
+    const response = await fetch(apiUrl);
     const data = await response.json();
     console.log('✅ Cron job completed:', data);
   } catch (error) {
