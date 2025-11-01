@@ -223,6 +223,30 @@ app.get('/api/predictions/active', async (req, res) => {
   }
 });
 
+app.get('/api/predictions/completed', async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT * FROM predictions WHERE status = $1 ORDER BY created_at DESC',
+      ['completed']
+    );
+    
+    // Her prediction için renk çıkar
+    for (const pred of result.rows) {
+      if (pred.home_logo) {
+        pred.home_colors = await getTeamColors(pred.home_logo);
+      }
+      if (pred.away_logo) {
+        pred.away_colors = await getTeamColors(pred.away_logo);
+      }
+    }
+    
+    res.json({ success: true, predictions: result.rows });
+  } catch (error) {
+    console.error('Get completed predictions error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.post('/api/predictions', async (req, res) => {
   try {
     const { match_id, home_team, away_team, league, prediction_type, odds, confidence, home_logo, away_logo, league_flag, league_logo, home_score, away_score } = req.body;
