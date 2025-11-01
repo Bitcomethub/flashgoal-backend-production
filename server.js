@@ -9,7 +9,17 @@ const getColors = require('get-image-colors');
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-app.use(cors());
+// CORS middleware - EN ÜSTTE OLMALI (tüm route'lardan önce)
+app.use(cors({
+  origin: '*', // Tüm origin'lere izin ver
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+  credentials: false // Cookie-based auth kullanmıyorsak false
+}));
+
+// OPTIONS request'leri için preflight handling
+app.options('*', cors());
+
 app.use(express.json());
 
 // Rate limiting için basit memory store
