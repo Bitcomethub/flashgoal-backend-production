@@ -12,6 +12,43 @@ const PORT = process.env.PORT || 8080;
 app.use(cors());
 app.use(express.json());
 
+// Rate limiting için basit memory store
+const rateLimitStore = new Map();
+
+// Rate limiting middleware (batch endpoint için)
+const rateLimitBatch = (req, res, next) => {
+  const ip = req.ip || req.connection.remoteAddress;
+  const now = Date.now();
+  const windowMs = 10000; // 10 saniye
+  
+  const userRequests = rateLimitStore.get(ip) || [];
+  const recentRequests = userRequests.filter(time => now - time < windowMs);
+  
+  if (recentRequests.length >= 1) {
+    return res.status(429).json({ 
+      error: 'Too many requests. Please wait 10 seconds before making another batch request.' 
+    });
+  }
+  
+  recentRequests.push(now);
+  rateLimitStore.set(ip, recentRequests);
+  
+  // Cleanup eski kayıtları (her 5 dakikada bir temizle)
+  if (Math.random() < 0.01) { // %1 şansla temizle
+    const fiveMinutesAgo = now - 300000;
+    for (const [key, requests] of rateLimitStore.entries()) {
+      const filtered = requests.filter(time => now - time < fiveMinutesAgo);
+      if (filtered.length === 0) {
+        rateLimitStore.delete(key);
+      } else {
+        rateLimitStore.set(key, filtered);
+      }
+    }
+  }
+  
+  next();
+};
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
@@ -187,6 +224,57 @@ app.get('/api/matches/:id', async (req, res) => {
   } catch (error) {
     console.error('❌ Error fetching match:', error);
     res.status(500).json({ error: 'Failed to fetch match data' });
+  }
+});
+
+app.post('/api/matches/batch', rateLimitBatch, async (req, res) => {
+  const { matchIds } = req.body;
+  
+  // Validasyon
+  if (!matchIds || !Array.isArray(matchIds) || matchIds.length === 0) {
+    return res.status(400).json({ error: 'matchIds array is required' });
+  }
+  
+  if (matchIds.length > 50) {
+    return res.status(400).json({ error: 'Maximum 50 matches per request' });
+  }
+  
+  try {
+    // API-Football'a tek seferde istek at
+    // Not: API-Football 'ids' parametresi destekliyor
+    const idsParam = matchIds.join('-');
+    
+    const response = await axios.get(
+      'https://v3.football.api-sports.io/fixtures',
+      {
+        params: { ids: idsParam },
+        headers: {
+          'x-apisports-key': process.env.FOOTBALL_API_KEY || process.env.API_SPORTS_KEY
+        }
+      }
+    );
+    
+    if (!response.data.response || response.data.response.length === 0) {
+      return res.json([]);
+    }
+    
+    // Her maç için data formatla
+    const matches = response.data.response.map(match => ({
+      matchId: match.fixture.id,
+      status: match.fixture.status.short,
+      minute: match.fixture.status.elapsed,
+      isLive: match.fixture.status.short !== 'FT' && 
+              match.fixture.status.short !== 'NS' &&
+              match.fixture.status.short !== 'CANC',
+      homeScore: match.goals.home || 0,
+      awayScore: match.goals.away || 0
+    }));
+    
+    res.json(matches);
+    
+  } catch (error) {
+    console.error('❌ Error fetching batch matches:', error.message);
+    res.status(500).json({ error: 'Failed to fetch matches' });
   }
 });
 
