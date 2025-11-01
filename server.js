@@ -143,6 +143,41 @@ app.get('/api/matches/live', async (req, res) => {
   }
 });
 
+app.get('/api/matches/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    // Football API'den çek
+    const response = await fetch(
+      `https://v3.football.api-sports.io/fixtures?id=${id}`,
+      {
+        headers: {
+          'x-apisports-key': process.env.FOOTBALL_API_KEY
+        }
+      }
+    );
+    
+    const data = await response.json();
+    const fixture = data.response[0];
+    
+    if (fixture) {
+      res.json({
+        homeScore: fixture.goals.home,
+        awayScore: fixture.goals.away,
+        minute: fixture.fixture.status.elapsed,
+        isLive: fixture.fixture.status.short === '1H' || fixture.fixture.status.short === '2H',
+        homeLogo: fixture.teams.home.logo,
+        awayLogo: fixture.teams.away.logo,
+      });
+    } else {
+      res.status(404).json({ error: 'Match not found' });
+    }
+  } catch (error) {
+    console.error('Get match error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.get('/api/predictions', async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM predictions ORDER BY created_at DESC');
