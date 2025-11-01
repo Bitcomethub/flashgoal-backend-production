@@ -206,6 +206,52 @@ app.delete('/api/predictions/:id', async (req, res) => {
   }
 });
 
+app.get('/api/cron/update-scores', async (req, res) => {
+  try {
+    // Aktif tahminleri çek
+    const predictions = await pool.query(
+      'SELECT * FROM predictions WHERE status = $1',
+      ['active']
+    );
+
+    let updated = 0;
+
+    for (const pred of predictions.rows) {
+      // Football API'den maç skorunu çek
+      const matchData = await fetch(
+        `https://v3.football.api-sports.io/fixtures?id=${pred.match_id}`,
+        {
+          headers: {
+            'x-apisports-key': process.env.FOOTBALL_API_KEY
+          }
+        }
+      );
+      
+      const data = await matchData.json();
+      const fixture = data.response[0];
+      
+      if (fixture && fixture.fixture.status.short === 'FT') {
+        // Maç bitti, skorları güncelle
+        await pool.query(
+          'UPDATE predictions SET home_score = $1, away_score = $2, status = $3 WHERE id = $4',
+          [
+            fixture.goals.home,
+            fixture.goals.away,
+            'completed',
+            pred.id
+          ]
+        );
+        updated++;
+      }
+    }
+
+    res.json({ success: true, updated });
+  } catch (error) {
+    console.error('Update scores error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.get('/health', async (req, res) => {
   try {
     await pool.query('SELECT 1');
