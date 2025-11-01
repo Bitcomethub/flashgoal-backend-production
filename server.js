@@ -90,9 +90,23 @@ async function initDatabase() {
         home_score INT DEFAULT 0,
         away_score INT DEFAULT 0,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        completed_at TIMESTAMP
       )
     `);
+    
+    // Add completed_at column if it doesn't exist (for existing tables)
+    try {
+      await pool.query(`
+        ALTER TABLE predictions 
+        ADD COLUMN IF NOT EXISTS completed_at TIMESTAMP
+      `);
+      console.log('✅ completed_at column ready');
+    } catch (error) {
+      if (!error.message.includes('does not exist')) {
+        console.log('ℹ️ completed_at column check:', error.message);
+      }
+    }
     
     // Update match_id column type if it's INTEGER (for existing tables)
     try {
@@ -326,7 +340,7 @@ app.get('/api/predictions/active', async (req, res) => {
 app.get('/api/predictions/completed', async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT * FROM predictions WHERE status = $1 ORDER BY created_at DESC',
+      'SELECT * FROM predictions WHERE status = $1 ORDER BY completed_at DESC NULLS LAST, created_at DESC',
       ['completed']
     );
     
@@ -343,6 +357,33 @@ app.get('/api/predictions/completed', async (req, res) => {
     res.json({ success: true, predictions: result.rows });
   } catch (error) {
     console.error('Get completed predictions error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Test endpoint - Check completed predictions with scores
+app.get('/api/test/completed-predictions', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, home_team, away_team, home_score, away_score, status, result, completed_at, prediction_type, match_id
+       FROM predictions
+       WHERE status = 'completed'
+       ORDER BY completed_at DESC NULLS LAST, created_at DESC
+       LIMIT 10`
+    );
+    
+    res.json({ 
+      success: true, 
+      count: result.rows.length,
+      predictions: result.rows,
+      summary: {
+        withScores: result.rows.filter(p => p.home_score !== null && p.home_score !== undefined && p.away_score !== null && p.away_score !== undefined).length,
+        withoutScores: result.rows.filter(p => p.home_score === null || p.home_score === undefined || p.away_score === null || p.away_score === undefined).length,
+        zeroScores: result.rows.filter(p => p.home_score === 0 && p.away_score === 0).length
+      }
+    });
+  } catch (error) {
+    console.error('Test query error:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -402,13 +443,16 @@ app.delete('/api/predictions/:id', async (req, res) => {
 
 app.get('/api/cron/update-scores', async (req, res) => {
   try {
+    console.log('🕐 [CRON] Checking predictions...');
     // Aktif tahminleri çek
     const predictions = await pool.query(
       'SELECT * FROM predictions WHERE status = $1',
       ['active']
     );
 
+    console.log(`📊 Found ${predictions.rows.length} active predictions`);
     let updated = 0;
+    let scoreUpdated = 0;
 
     for (const pred of predictions.rows) {
       try {
@@ -425,78 +469,148 @@ app.get('/api/cron/update-scores', async (req, res) => {
         const data = await matchData.json();
         const fixture = data.response[0];
         
-        if (!fixture) continue;
+        if (!fixture) {
+          console.log(`⚠️ No fixture found for match_id: ${pred.match_id}`);
+          continue;
+        }
         
         const statusShort = fixture.fixture.status.short;
-        const homeGoals = fixture.goals.home || 0;
-        const awayGoals = fixture.goals.away || 0;
-        const total = homeGoals + awayGoals;
+        const homeGoals = fixture.goals.home ?? null;
+        const awayGoals = fixture.goals.away ?? null;
+        
+        // API'den skor gelmiyorsa logla
+        if (homeGoals === null || awayGoals === null) {
+          console.log(`⚠️ Match ${pred.match_id} - Goals are null: home=${homeGoals}, away=${awayGoals}, status=${statusShort}`);
+        }
+        
+        const homeScore = homeGoals !== null ? homeGoals : 0;
+        const awayScore = awayGoals !== null ? awayGoals : 0;
+        const total = homeScore + awayScore;
         
         const predType = pred.prediction_type.toUpperCase();
+        const isFinished = ["FT", "AET", "PEN"].includes(statusShort);
+        const isHT = ["HT", "2H", "FT", "AET", "PEN"].includes(statusShort);
+        
         let result = null;
         let shouldUpdate = false;
+        let shouldUpdateScore = false;
         
-        // MB tahminleri için canlı maç kontrolü
-        if (predType.includes("MB")) {
-          const isLive = ["1H", "2H", "HT", "FT", "AET", "PEN"].includes(statusShort);
-          const isFinished = ["FT", "AET", "PEN"].includes(statusShort);
+        // FT durumunda skorları her zaman güncelle
+        if (isFinished) {
+          shouldUpdateScore = true;
+          
+          // İY (İlk Yarı) tahminleri kontrolü
+          if (predType.includes("İY") || predType.includes("IY")) {
+            const htScore = fixture.score?.halftime;
+            const htTotal = htScore ? (htScore.home || 0) + (htScore.away || 0) : 0;
+            
+            if (predType.includes("0.5Ü")) result = htTotal > 0.5 ? "won" : "lost";
+            else if (predType.includes("1.5Ü")) result = htTotal > 1.5 ? "won" : "lost";
+            else if (predType.includes("2.5Ü")) result = htTotal > 2.5 ? "won" : "lost";
+            
+            shouldUpdate = true;
+          }
+          // MB (Maç Boyu) tahminleri kontrolü
+          else if (predType.includes("MB")) {
+            if (predType.includes("0.5Ü")) result = total > 0.5 ? "won" : "lost";
+            else if (predType.includes("1.5Ü")) result = total > 1.5 ? "won" : "lost";
+            else if (predType.includes("2.5Ü")) result = total > 2.5 ? "won" : "lost";
+            else if (predType.includes("3.5Ü")) result = total > 3.5 ? "won" : "lost";
+            else if (predType.includes("4.5Ü")) result = total > 4.5 ? "won" : "lost";
+            else if (predType.includes("KGV")) result = homeScore > 0 && awayScore > 0 ? "won" : "lost";
+            
+            shouldUpdate = true;
+          }
+          // Diğer tahmin tipleri için de skorları güncelle
+          else {
+            shouldUpdate = true;
+            // Result belirlenemediyse null bırak
+          }
+        }
+        // MB tahminleri için canlı maç kontrolü (erken kazanma)
+        else if (predType.includes("MB")) {
+          const isLive = ["1H", "2H", "HT"].includes(statusShort);
           
           if (isLive) {
             // Erken kazanma kontrolü
             if (predType.includes("0.5Ü")) {
               if (total >= 1) result = "won";
-              else if (isFinished) result = "lost";
             }
             else if (predType.includes("1.5Ü")) {
               if (total >= 2) result = "won";
-              else if (isFinished) result = "lost";
             }
             else if (predType.includes("2.5Ü")) {
               if (total >= 3) result = "won";
-              else if (isFinished) result = "lost";
             }
             else if (predType.includes("3.5Ü")) {
               if (total >= 4) result = "won";
-              else if (isFinished) result = "lost";
             }
             else if (predType.includes("4.5Ü")) {
               if (total >= 5) result = "won";
-              else if (isFinished) result = "lost";
             }
             else if (predType.includes("KGV")) {
-              if (homeGoals > 0 && awayGoals > 0) result = "won";
-              else if (isFinished) result = "lost";
+              if (homeScore > 0 && awayScore > 0) result = "won";
             }
             
-            // Kazandıysa hemen güncelle, kaybetti ise sadece maç bittiyse güncelle
-            if (result === "won" || (result === "lost" && isFinished)) {
+            // Kazandıysa hemen güncelle
+            if (result === "won") {
               shouldUpdate = true;
+              shouldUpdateScore = true;
             }
           }
         }
+        // İY tahminleri için HT kontrolü
+        else if (predType.includes("İY") || predType.includes("IY")) {
+          if (isHT) {
+            const htScore = fixture.score?.halftime;
+            const htTotal = htScore ? (htScore.home || 0) + (htScore.away || 0) : 0;
+            
+            if (predType.includes("0.5Ü")) result = htTotal > 0.5 ? "won" : "lost";
+            else if (predType.includes("1.5Ü")) result = htTotal > 1.5 ? "won" : "lost";
+            else if (predType.includes("2.5Ü")) result = htTotal > 2.5 ? "won" : "lost";
+            
+            shouldUpdate = true;
+            shouldUpdateScore = true;
+          }
+        }
         
-        // Güncelleme yap
+        // Skorları güncelle (FT durumunda her zaman)
+        if (shouldUpdateScore) {
+          await pool.query(
+            'UPDATE predictions SET home_score = $1, away_score = $2, updated_at = NOW() WHERE id = $3',
+            [homeScore, awayScore, pred.id]
+          );
+          scoreUpdated++;
+          console.log(`✅ Updated scores for #${pred.id}: ${homeScore}-${awayScore} (status: ${statusShort})`);
+        }
+        
+        // Status ve result güncelle
         if (shouldUpdate && result) {
           await pool.query(
-            'UPDATE predictions SET home_score = $1, away_score = $2, status = $3, result = $4, updated_at = NOW() WHERE id = $5',
-            [
-              homeGoals,
-              awayGoals,
-              'completed',
-              result,
-              pred.id
-            ]
+            'UPDATE predictions SET status = $1, result = $2, completed_at = NOW(), updated_at = NOW() WHERE id = $3',
+            ['completed', result, pred.id]
           );
           updated++;
+          console.log(`✅ Completed prediction #${pred.id}: ${result.toUpperCase()} (${homeScore}-${awayScore})`);
+        }
+        // FT durumunda result belirlenemediyse sadece status'u güncelle
+        else if (isFinished && shouldUpdateScore) {
+          await pool.query(
+            'UPDATE predictions SET status = $1, completed_at = NOW(), updated_at = NOW() WHERE id = $2',
+            ['completed', pred.id]
+          );
+          updated++;
+          console.log(`✅ Completed prediction #${pred.id} (FT, no result logic): ${homeScore}-${awayScore}`);
         }
       } catch (err) {
-        console.error(`Error updating prediction #${pred.id}:`, err.message);
+        console.error(`❌ Error updating prediction #${pred.id}:`, err.message);
       }
     }
 
-    res.json({ success: true, updated });
+    console.log(`✅ Cron job completed: ${updated} predictions completed, ${scoreUpdated} scores updated`);
+    res.json({ success: true, updated, scoreUpdated, total: predictions.rows.length });
   } catch (error) {
-    console.error('Update scores error:', error);
+    console.error('❌ Update scores error:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -559,19 +673,31 @@ cron.schedule("*/30 * * * * *", async () => {
         
         const statusShort = fixture.fixture.status.short;
         const predType = pred.prediction_type.toUpperCase();
-        const homeGoals = fixture.goals.home || 0;
-        const awayGoals = fixture.goals.away || 0;
-        const total = homeGoals + awayGoals;
+        const homeGoals = fixture.goals.home ?? null;
+        const awayGoals = fixture.goals.away ?? null;
         
-        const htScore = fixture.score.halftime;
-        const htTotal = (htScore?.home || 0) + (htScore?.away || 0);
+        // Handle null scores
+        const homeScore = homeGoals !== null ? homeGoals : 0;
+        const awayScore = awayGoals !== null ? awayGoals : 0;
+        const total = homeScore + awayScore;
+        
+        const htScore = fixture.score?.halftime;
+        const htTotal = htScore ? (htScore.home || 0) + (htScore.away || 0) : 0;
+        
+        const isFinished = ["FT", "AET", "PEN"].includes(statusShort);
+        const isHT = ["HT", "2H", "FT", "AET", "PEN"].includes(statusShort);
         
         let result = null;
         let shouldUpdate = false;
+        let shouldUpdateScore = false;
+        
+        // FT durumunda skorları her zaman güncelle
+        if (isFinished) {
+          shouldUpdateScore = true;
+        }
         
         // İY (İlk Yarı) tahminleri - HT'de kontrol et
-        if (predType.includes("İY")) {
-          const isHT = ["HT", "2H", "FT", "AET", "PEN"].includes(statusShort);
+        if (predType.includes("İY") || predType.includes("IY")) {
           if (isHT) {
             if (predType.includes("0.5Ü")) result = htTotal > 0.5 ? "won" : "lost";
             else if (predType.includes("1.5Ü")) result = htTotal > 1.5 ? "won" : "lost";
@@ -582,7 +708,6 @@ cron.schedule("*/30 * * * * *", async () => {
         // MB (Maç Boyu) tahminleri - Canlı maçta erken kazanma kontrolü
         else if (predType.includes("MB")) {
           const isLive = ["1H", "2H", "HT", "FT", "AET", "PEN"].includes(statusShort);
-          const isFinished = ["FT", "AET", "PEN"].includes(statusShort);
           
           if (isLive) {
             // MB tahminleri için erken kazanma kontrolü
@@ -607,7 +732,7 @@ cron.schedule("*/30 * * * * *", async () => {
               else if (isFinished) result = "lost"; // Maç bitti ve <5 gol = kaybetti
             }
             else if (predType.includes("KGV")) {
-              if (homeGoals > 0 && awayGoals > 0) result = "won"; // Her iki takım gol attı
+              if (homeScore > 0 && awayScore > 0) result = "won"; // Her iki takım gol attı
               else if (isFinished) result = "lost"; // Maç bitti ve bir takım gol atmadı
             }
             
@@ -618,14 +743,30 @@ cron.schedule("*/30 * * * * *", async () => {
           }
         }
         
-        // Güncelleme yap
+        // Skorları güncelle (FT durumunda her zaman)
+        if (shouldUpdateScore) {
+          await pool.query(
+            "UPDATE predictions SET home_score = $1, away_score = $2, updated_at = NOW() WHERE id = $3",
+            [homeScore, awayScore, pred.id]
+          );
+        }
+        
+        // Status ve result güncelle
         if (shouldUpdate && result) {
           await pool.query(
-            "UPDATE predictions SET status = 'completed', result = $1, home_score = $2, away_score = $3, updated_at = NOW() WHERE id = $4",
-            [result, homeGoals, awayGoals, pred.id]
+            "UPDATE predictions SET status = 'completed', result = $1, completed_at = NOW(), home_score = $2, away_score = $3, updated_at = NOW() WHERE id = $4",
+            [result, homeScore, awayScore, pred.id]
           );
           const liveStatus = ["1H", "2H", "HT"].includes(statusShort) ? " (LIVE)" : "";
-          console.log(`✅ #${pred.id}: ${result.toUpperCase()}${liveStatus} - Status updated to 'completed'`);
+          console.log(`✅ #${pred.id}: ${result.toUpperCase()}${liveStatus} - ${homeScore}-${awayScore}`);
+        }
+        // FT durumunda result belirlenemediyse sadece status'u güncelle
+        else if (isFinished && shouldUpdateScore) {
+          await pool.query(
+            "UPDATE predictions SET status = 'completed', completed_at = NOW(), home_score = $1, away_score = $2, updated_at = NOW() WHERE id = $3",
+            [homeScore, awayScore, pred.id]
+          );
+          console.log(`✅ #${pred.id}: Completed (FT) - ${homeScore}-${awayScore}`);
         }
       } catch (err) {
         console.error(`❌ Check #${pred.id}:`, err.message);
@@ -699,17 +840,18 @@ app.get("/api/vip/check/:userId", async (req, res) => {
 
 // Cron job - her 10 dakikada skorları güncelle
 cron.schedule('*/10 * * * *', async () => {
-  console.log('🕐 Running cron job - updating match scores...');
+  console.log('🕐 [10MIN CRON] Running cron job - updating match scores...');
   try {
     const apiUrl = process.env.RAILWAY_PUBLIC_DOMAIN 
       ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}/api/cron/update-scores`
-      : 'http://localhost:3000/api/cron/update-scores';
+      : `http://localhost:${PORT}/api/cron/update-scores`;
     
+    console.log(`📡 Calling: ${apiUrl}`);
     const response = await fetch(apiUrl);
     const data = await response.json();
-    console.log('✅ Cron job completed:', data);
+    console.log('✅ [10MIN CRON] Cron job completed:', data);
   } catch (error) {
-    console.error('❌ Cron job failed:', error);
+    console.error('❌ [10MIN CRON] Cron job failed:', error.message);
   }
 });
 
