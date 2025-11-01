@@ -192,6 +192,17 @@ app.get('/api/matches/:id', async (req, res) => {
 app.get('/api/predictions', async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM predictions ORDER BY created_at DESC');
+    
+    // Her prediction için renk çıkar
+    for (const pred of result.rows) {
+      if (pred.home_logo) {
+        pred.home_colors = await getTeamColors(pred.home_logo);
+      }
+      if (pred.away_logo) {
+        pred.away_colors = await getTeamColors(pred.away_logo);
+      }
+    }
+    
     res.json({ success: true, count: result.rows.length, predictions: result.rows });
   } catch (error) {
     console.error('❌ Get predictions:', error);
