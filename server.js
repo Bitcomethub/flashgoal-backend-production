@@ -24,7 +24,7 @@ async function initDatabase() {
     await pool.query(`
       CREATE TABLE IF NOT EXISTS predictions (
         id SERIAL PRIMARY KEY,
-        match_id INTEGER NOT NULL,
+        match_id VARCHAR(255) NOT NULL,
         home_team VARCHAR(255) NOT NULL,
         away_team VARCHAR(255) NOT NULL,
         league VARCHAR(255),
@@ -45,6 +45,21 @@ async function initDatabase() {
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
+    
+    // Update match_id column type if it's INTEGER (for existing tables)
+    try {
+      await pool.query(`
+        ALTER TABLE predictions 
+        ALTER COLUMN match_id TYPE VARCHAR(255) USING match_id::VARCHAR(255)
+      `);
+      console.log('✅ match_id column updated to VARCHAR');
+    } catch (error) {
+      // Column might already be VARCHAR or table might not exist yet
+      if (!error.message.includes('does not exist') && !error.message.includes('type')) {
+        console.log('ℹ️ match_id column type update skipped:', error.message);
+      }
+    }
+    
     console.log('✅ Table ready');
     
     // Create vip_access table
