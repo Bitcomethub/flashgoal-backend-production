@@ -155,37 +155,42 @@ app.get('/api/matches/live', async (req, res) => {
 });
 
 app.get('/api/matches/:id', async (req, res) => {
+  const matchId = req.params.id;
+  
+  console.log('🔍 Fetching match:', matchId);
+  
   try {
-    const { id } = req.params;
-    
-    // Football API'den çek
-    const response = await fetch(
-      `https://v3.football.api-sports.io/fixtures?id=${id}`,
+    const response = await axios.get(
+      `https://v3.football.api-sports.io/fixtures`,
       {
+        params: { id: matchId },
         headers: {
-          'x-apisports-key': process.env.FOOTBALL_API_KEY
+          'x-apisports-key': process.env.FOOTBALL_API_KEY || process.env.API_SPORTS_KEY
         }
       }
     );
     
-    const data = await response.json();
-    const fixture = data.response[0];
+    console.log('✅ API Response:', response.data);
     
-    if (fixture) {
-      res.json({
-        homeScore: fixture.goals.home,
-        awayScore: fixture.goals.away,
-        minute: fixture.fixture.status.elapsed,
-        isLive: fixture.fixture.status.short === '1H' || fixture.fixture.status.short === '2H',
-        homeLogo: fixture.teams.home.logo,
-        awayLogo: fixture.teams.away.logo,
-      });
-    } else {
-      res.status(404).json({ error: 'Match not found' });
+    if (!response.data.response || response.data.response.length === 0) {
+      return res.status(404).json({ error: 'Match not found' });
     }
+    
+    const match = response.data.response[0];
+    
+    res.json({
+      matchId: match.fixture.id,
+      status: match.fixture.status.short,
+      minute: match.fixture.status.elapsed,
+      isLive: match.fixture.status.short !== 'FT' && 
+              match.fixture.status.short !== 'NS',
+      homeScore: match.goals.home,
+      awayScore: match.goals.away
+    });
+    
   } catch (error) {
-    console.error('Get match error:', error);
-    res.status(500).json({ error: error.message });
+    console.error('❌ Error fetching match:', error);
+    res.status(500).json({ error: 'Failed to fetch match data' });
   }
 });
 
