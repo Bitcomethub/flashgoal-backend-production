@@ -4,6 +4,7 @@ const cors = require('cors');
 const { Pool } = require('pg');
 const axios = require('axios');
 const cron = require("node-cron");
+const getColors = require('get-image-colors');
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -15,6 +16,16 @@ const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
 });
+
+async function getTeamColors(logoUrl) {
+  try {
+    const colors = await getColors(logoUrl);
+    return colors.slice(0, 2).map(c => c.hex());
+  } catch (error) {
+    console.error('Color extract error:', error);
+    return ['#10B981', '#3B82F6']; // Default yeşil-mavi
+  }
+}
 
 async function initDatabase() {
   try {
@@ -191,10 +202,19 @@ app.get('/api/predictions', async (req, res) => {
 app.get('/api/predictions/active', async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT * FROM predictions 
-       WHERE status = 'active' 
-       ORDER BY created_at DESC`
+      'SELECT * FROM predictions WHERE status = $1 ORDER BY created_at DESC',
+      ['active']
     );
+    
+    // Her prediction için renk çıkar
+    for (const pred of result.rows) {
+      if (pred.home_logo) {
+        pred.home_colors = await getTeamColors(pred.home_logo);
+      }
+      if (pred.away_logo) {
+        pred.away_colors = await getTeamColors(pred.away_logo);
+      }
+    }
     
     res.json({ success: true, predictions: result.rows });
   } catch (error) {
