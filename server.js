@@ -418,6 +418,18 @@ app.get("/api/vip/check/:userId", async (req, res) => {
   }
 });
 
+// Cron job - her 10 dakikada skorları güncelle
+cron.schedule('*/10 * * * *', async () => {
+  console.log('🕐 Running cron job - updating match scores...');
+  try {
+    const response = await fetch(`${process.env.RAILWAY_PUBLIC_DOMAIN || 'http://localhost:3000'}/api/cron/update-scores`);
+    const data = await response.json();
+    console.log('✅ Cron job completed:', data);
+  } catch (error) {
+    console.error('❌ Cron job failed:', error);
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`🚀 FlashGoal API v5.1 - Port ${PORT}`);
 
