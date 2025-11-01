@@ -157,8 +157,6 @@ app.get('/api/matches/live', async (req, res) => {
 app.get('/api/matches/:id', async (req, res) => {
   const matchId = req.params.id;
   
-  console.log('🔍 Fetching match:', matchId);
-  
   try {
     const response = await axios.get(
       `https://v3.football.api-sports.io/fixtures`,
@@ -169,8 +167,6 @@ app.get('/api/matches/:id', async (req, res) => {
         }
       }
     );
-    
-    console.log('✅ API Response:', response.data);
     
     if (!response.data.response || response.data.response.length === 0) {
       return res.status(404).json({ error: 'Match not found' });
