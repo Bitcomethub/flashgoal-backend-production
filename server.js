@@ -153,6 +153,21 @@ app.get('/api/predictions', async (req, res) => {
   }
 });
 
+app.get('/api/predictions/active', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT * FROM predictions 
+       WHERE status = 'active' 
+       ORDER BY created_at DESC`
+    );
+    
+    res.json({ success: true, predictions: result.rows });
+  } catch (error) {
+    console.error('Get active predictions error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.post('/api/predictions', async (req, res) => {
   try {
     const { match_id, home_team, away_team, league, prediction_type, odds, confidence, home_logo, away_logo, league_flag, league_logo, home_score, away_score } = req.body;
