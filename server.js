@@ -103,6 +103,7 @@ async function initDatabase() {
         league_logo VARCHAR(500),
         home_score INT DEFAULT 0,
         away_score INT DEFAULT 0,
+        is_urgent BOOLEAN DEFAULT FALSE,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         completed_at TIMESTAMP
@@ -119,6 +120,19 @@ async function initDatabase() {
     } catch (error) {
       if (!error.message.includes('does not exist')) {
         console.log('ℹ️ completed_at column check:', error.message);
+      }
+    }
+    
+    // Add is_urgent column if it doesn't exist (for existing tables)
+    try {
+      await pool.query(`
+        ALTER TABLE predictions 
+        ADD COLUMN IF NOT EXISTS is_urgent BOOLEAN DEFAULT FALSE
+      `);
+      console.log('✅ is_urgent column added');
+    } catch (error) {
+      if (!error.message.includes('does not exist')) {
+        console.log('ℹ️ is_urgent column already exists');
       }
     }
     
@@ -404,20 +418,21 @@ app.get('/api/test/completed-predictions', async (req, res) => {
 
 app.post('/api/predictions', async (req, res) => {
   try {
-    const { match_id, home_team, away_team, league, prediction_type, odds, confidence, home_logo, away_logo, league_flag, league_logo, home_score, away_score } = req.body;
+    const { match_id, home_team, away_team, league, prediction_type, odds, confidence, home_logo, away_logo, league_flag, league_logo, home_score, away_score, is_urgent } = req.body;
 
     if (!match_id || !home_team || !away_team || !prediction_type) {
       return res.status(400).json({ success: false, error: 'Missing fields' });
     }
 
     const oddsValue = odds && !isNaN(parseFloat(odds)) ? parseFloat(odds) : 0;
+    const isUrgentValue = is_urgent === true || is_urgent === 'true';
 
     const result = await pool.query(
       `INSERT INTO predictions 
-       (match_id, home_team, away_team, league, prediction_type, odds, confidence, status, home_logo, away_logo, league_flag, league_logo, home_score, away_score) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7, 'active', $8, $9, $10, $11, $12, $13) 
+       (match_id, home_team, away_team, league, prediction_type, odds, confidence, status, home_logo, away_logo, league_flag, league_logo, home_score, away_score, is_urgent) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, 'active', $8, $9, $10, $11, $12, $13, $14) 
        RETURNING *`,
-      [match_id, home_team, away_team, league, prediction_type, oddsValue, confidence || 'orta', home_logo || null, away_logo || null, league_flag || null, league_logo || null, home_score || 0, away_score || 0]
+      [match_id, home_team, away_team, league, prediction_type, oddsValue, confidence || 'orta', home_logo || null, away_logo || null, league_flag || null, league_logo || null, home_score || 0, away_score || 0, isUrgentValue]
     );
 
     res.status(201).json({ success: true, prediction: result.rows[0] });
