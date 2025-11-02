@@ -168,6 +168,51 @@ async function initDatabase() {
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_vip_expiry ON vip_access(expiry_date)`);
     console.log('✅ VIP access table ready');
     
+    // ==========================================
+    // REFERRAL SYSTEM - Database Schema
+    // ==========================================
+    
+    // Add referral columns to users table
+    try {
+      await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_code VARCHAR(20)`);
+      // Try to add unique constraint (ignore if already exists)
+      try {
+        await pool.query(`ALTER TABLE users ADD CONSTRAINT users_referral_code_unique UNIQUE (referral_code)`);
+      } catch (err) {
+        // Constraint might already exist, ignore
+      }
+      await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by VARCHAR(20)`);
+      await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_count INT DEFAULT 0`);
+      await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS vip_bonus_days INT DEFAULT 0`);
+      console.log('✅ Referral columns added to users table');
+    } catch (error) {
+      // Ignore "already exists" errors
+      if (!error.message.includes('already exists') && !error.message.includes('duplicate')) {
+        console.log('ℹ️ Users table referral columns check:', error.message);
+      }
+    }
+    
+    // Create referrals table
+    try {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS referrals (
+          id SERIAL PRIMARY KEY,
+          referrer_code VARCHAR(20) NOT NULL,
+          referrer_user_id INT,
+          referred_user_id INT,
+          referred_email VARCHAR(255),
+          status VARCHAR(20) DEFAULT 'completed',
+          bonus_given BOOLEAN DEFAULT FALSE,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+      `);
+      console.log('✅ Referrals table ready');
+    } catch (error) {
+      if (!error.message.includes('already exists')) {
+        console.log('ℹ️ Referrals table check:', error.message);
+      }
+    }
+    
     await pool.query('DROP TABLE IF EXISTS pending_predictions CASCADE');
     console.log('🗑️ Cleaned');
     
@@ -806,6 +851,314 @@ cron.schedule("*/30 * * * * *", async () => {
   }
 });
 
+
+// ==========================================
+// REFERRAL SYSTEM - Helper Functions
+// ==========================================
+
+// Generate unique referral code (6 characters: uppercase + number)
+async function generateReferralCode() {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+  const numbers = '0123456789';
+  let code;
+  let exists = true;
+  
+  while (exists) {
+    // Generate 4 uppercase letters + 2 numbers
+    const letters = Array.from({ length: 4 }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
+    const nums = Array.from({ length: 2 }, () => numbers[Math.floor(Math.random() * numbers.length)]).join('');
+    code = letters + nums;
+    
+    // Check if code already exists
+    const result = await pool.query('SELECT id FROM users WHERE referral_code = $1', [code]);
+    exists = result.rows.length > 0;
+  }
+  
+  return code;
+}
+
+// Add VIP days to user (extend existing or create new)
+async function addVIPDays(userId, days) {
+  try {
+    // Check if user has existing VIP
+    const existing = await pool.query(
+      'SELECT expiry_date FROM vip_access WHERE user_id = $1',
+      [userId]
+    );
+    
+    let expiryDate;
+    if (existing.rows.length > 0 && existing.rows[0].expiry_date) {
+      // Extend existing VIP
+      const currentExpiry = new Date(existing.rows[0].expiry_date);
+      expiryDate = new Date(currentExpiry);
+      expiryDate.setDate(expiryDate.getDate() + days);
+    } else {
+      // Create new VIP
+      expiryDate = new Date();
+      expiryDate.setDate(expiryDate.getDate() + days);
+    }
+    
+    await pool.query(
+      `INSERT INTO vip_access (user_id, expiry_date, product_id) 
+       VALUES ($1, $2, $3)
+       ON CONFLICT (user_id) 
+       DO UPDATE SET expiry_date = $2, updated_at = NOW()`,
+      [userId, expiryDate, 'referral_bonus']
+    );
+    
+    return expiryDate;
+  } catch (error) {
+    console.error('Error adding VIP days:', error);
+    throw error;
+  }
+}
+
+// ==========================================
+// REFERRAL SYSTEM - API Endpoints
+// ==========================================
+
+// GET /api/user/referral-info
+app.get('/api/user/referral-info', async (req, res) => {
+  try {
+    const { userId } = req.query;
+    
+    if (!userId) {
+      return res.status(400).json({ success: false, error: 'userId is required' });
+    }
+    
+    const result = await pool.query(
+      'SELECT referral_code, referral_count, vip_bonus_days, referred_by FROM users WHERE id = $1',
+      [userId]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+    
+    const user = result.rows[0];
+    res.json({
+      success: true,
+      referral_code: user.referral_code || null,
+      referral_count: user.referral_count || 0,
+      vip_bonus_days: user.vip_bonus_days || 0,
+      referred_by: user.referred_by || null
+    });
+  } catch (error) {
+    console.error('❌ Get referral info error:', error);
+    res.status(500).json({ success: false, error: 'Failed to get referral info' });
+  }
+});
+
+// POST /api/referral/validate
+app.post('/api/referral/validate', async (req, res) => {
+  try {
+    const { referral_code } = req.body;
+    
+    if (!referral_code) {
+      return res.status(400).json({ success: false, valid: false, message: 'Referral code is required' });
+    }
+    
+    // Check if referral code exists
+    const result = await pool.query(
+      'SELECT id, referral_count FROM users WHERE referral_code = $1',
+      [referral_code.toUpperCase()]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.json({ success: true, valid: false, message: 'Invalid referral code' });
+    }
+    
+    const user = result.rows[0];
+    const referralCount = user.referral_count || 0;
+    
+    // Check if referrer has reached max quota (2)
+    if (referralCount >= 2) {
+      return res.json({ 
+        success: true, 
+        valid: false, 
+        message: 'This referral code has reached its maximum referrals' 
+      });
+    }
+    
+    res.json({ success: true, valid: true, message: 'Referral code is valid' });
+  } catch (error) {
+    console.error('❌ Validate referral error:', error);
+    res.status(500).json({ success: false, valid: false, message: 'Failed to validate referral code' });
+  }
+});
+
+// POST /api/referral/register
+app.post('/api/referral/register', async (req, res) => {
+  try {
+    const { email, password, referral_code } = req.body;
+    
+    if (!email || !password) {
+      return res.status(400).json({ success: false, error: 'Email and password are required' });
+    }
+    
+    // Check if email already exists
+    const existingUser = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
+    if (existingUser.rows.length > 0) {
+      return res.status(400).json({ success: false, error: 'Email already registered' });
+    }
+    
+    // Generate unique referral code for new user
+    const newReferralCode = await generateReferralCode();
+    
+    // Start transaction: create user, handle referral, give VIP
+    const client = await pool.connect();
+    
+    try {
+      await client.query('BEGIN');
+      
+      // Create new user
+      const userResult = await client.query(
+        `INSERT INTO users (email, password, referral_code, referred_by) 
+         VALUES ($1, $2, $3, $4) 
+         RETURNING id`,
+        [email, password, newReferralCode, referral_code ? referral_code.toUpperCase() : null]
+      );
+      
+      const newUserId = userResult.rows[0].id;
+      
+      // Give 24 hours VIP to new user
+      const vipExpiry = new Date();
+      vipExpiry.setHours(vipExpiry.getHours() + 24);
+      
+      await client.query(
+        `INSERT INTO vip_access (user_id, expiry_date, product_id) 
+         VALUES ($1, $2, $3)
+         ON CONFLICT (user_id) 
+         DO UPDATE SET expiry_date = $2, updated_at = NOW()`,
+        [newUserId.toString(), vipExpiry, 'referral_signup']
+      );
+      
+      // Handle referral tracking if referral_code provided
+      if (referral_code) {
+        const referrerResult = await client.query(
+          'SELECT id, referral_count FROM users WHERE referral_code = $1',
+          [referral_code.toUpperCase()]
+        );
+        
+        if (referrerResult.rows.length > 0) {
+          const referrer = referrerResult.rows[0];
+          const currentCount = referrer.referral_count || 0;
+          
+          // Check if referrer hasn't reached max (2)
+          if (currentCount < 2) {
+            const newCount = currentCount + 1;
+            
+            // Update referrer's referral_count
+            await client.query(
+              'UPDATE users SET referral_count = $1 WHERE id = $2',
+              [newCount, referrer.id]
+            );
+            
+            // Add to referrals table
+            await client.query(
+              `INSERT INTO referrals (referrer_code, referrer_user_id, referred_user_id, referred_email, status, bonus_given) 
+               VALUES ($1, $2, $3, $4, 'completed', $5)`,
+              [referral_code.toUpperCase(), referrer.id, newUserId, email, newCount === 2]
+            );
+            
+            // If this is the 2nd referral, give referrer 7 days VIP bonus
+            if (newCount === 2) {
+              // Check if referrer has existing VIP
+              const existingVIP = await client.query(
+                'SELECT expiry_date FROM vip_access WHERE user_id = $1',
+                [referrer.id.toString()]
+              );
+              
+              let vipExpiryDate;
+              if (existingVIP.rows.length > 0 && existingVIP.rows[0].expiry_date) {
+                // Extend existing VIP
+                const currentExpiry = new Date(existingVIP.rows[0].expiry_date);
+                vipExpiryDate = new Date(currentExpiry);
+                vipExpiryDate.setDate(vipExpiryDate.getDate() + 7);
+              } else {
+                // Create new VIP
+                vipExpiryDate = new Date();
+                vipExpiryDate.setDate(vipExpiryDate.getDate() + 7);
+              }
+              
+              await client.query(
+                `INSERT INTO vip_access (user_id, expiry_date, product_id) 
+                 VALUES ($1, $2, $3)
+                 ON CONFLICT (user_id) 
+                 DO UPDATE SET expiry_date = $2, updated_at = NOW()`,
+                [referrer.id.toString(), vipExpiryDate, 'referral_bonus']
+              );
+              
+              await client.query(
+                'UPDATE users SET vip_bonus_days = vip_bonus_days + 7 WHERE id = $1',
+                [referrer.id]
+              );
+              
+              // Update bonus_given in referrals table
+              await client.query(
+                'UPDATE referrals SET bonus_given = true WHERE referrer_user_id = $1 AND referred_user_id = $2',
+                [referrer.id, newUserId]
+              );
+            }
+          }
+        }
+      }
+      
+      await client.query('COMMIT');
+      
+      res.status(201).json({
+        success: true,
+        message: 'User registered successfully',
+        user: {
+          id: newUserId,
+          email: email,
+          referral_code: newReferralCode,
+          referred_by: referral_code || null
+        },
+        vip_expiry: vipExpiry
+      });
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    console.error('❌ Register with referral error:', error);
+    res.status(500).json({ success: false, error: 'Failed to register user' });
+  }
+});
+
+// GET /api/referral/history
+app.get('/api/referral/history', async (req, res) => {
+  try {
+    const { userId } = req.query;
+    
+    if (!userId) {
+      return res.status(400).json({ success: false, error: 'userId is required' });
+    }
+    
+    const result = await pool.query(
+      `SELECT referred_email, created_at, bonus_given 
+       FROM referrals 
+       WHERE referrer_user_id = $1 
+       ORDER BY created_at DESC`,
+      [userId]
+    );
+    
+    res.json({
+      success: true,
+      referrals: result.rows.map(row => ({
+        referred_email: row.referred_email,
+        created_at: row.created_at,
+        bonus_given: row.bonus_given
+      }))
+    });
+  } catch (error) {
+    console.error('❌ Get referral history error:', error);
+    res.status(500).json({ success: false, error: 'Failed to get referral history' });
+  }
+});
 
 // ==========================================
 // REVENUECAT WEBHOOK
