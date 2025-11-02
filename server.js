@@ -68,7 +68,122 @@ const pool = new Pool({
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
 });
 
-async function getTeamColors(logoUrl) {
+// ==========================================
+// TEAM COLORS DATABASE
+// ==========================================
+
+const TEAM_COLORS = {
+  // TÜRKİYE SÜPER LİG
+  'Galatasaray': ['#FDB913', '#C8102E'],
+  'Fenerbahçe': ['#FFED00', '#001489'],
+  'Fenerbahce': ['#FFED00', '#001489'], // Alternatif yazım
+  'Beşiktaş': ['#000000', '#FFFFFF'],
+  'Besiktas': ['#000000', '#FFFFFF'],
+  'Trabzonspor': ['#780109', '#7CCDEF'],
+  'Başakşehir': ['#F26522', '#00205B'],
+  'Basaksehir': ['#F26522', '#00205B'],
+
+  // İNGİLTERE PREMIER LEAGUE
+  'Arsenal': ['#EF0107', '#FFFFFF'],
+  'Liverpool': ['#C8102E', '#00B2A9'],
+  'Manchester United': ['#DA291C', '#FBE122'],
+  'Man United': ['#DA291C', '#FBE122'],
+  'Manchester City': ['#6CABDD', '#1C2C5B'],
+  'Man City': ['#6CABDD', '#1C2C5B'],
+  'Chelsea': ['#034694', '#DBA111'],
+  'Tottenham': ['#132257', '#FFFFFF'],
+  'Tottenham Hotspur': ['#132257', '#FFFFFF'],
+  'Leicester City': ['#003090', '#FDBE11'],
+  'West Ham': ['#7A263A', '#1BB1E7'],
+  'Everton': ['#003399', '#FFFFFF'],
+  'Newcastle': ['#000000', '#FFFFFF'],
+  'Newcastle United': ['#000000', '#FFFFFF'],
+
+  // İSPANYA LA LIGA
+  'Barcelona': ['#A50044', '#004D98'],
+  'FC Barcelona': ['#A50044', '#004D98'],
+  'Real Madrid': ['#FFFFFF', '#00529F'],
+  'Atletico Madrid': ['#CE3524', '#1A355C'],
+  'Atlético Madrid': ['#CE3524', '#1A355C'],
+  'Sevilla': ['#D6001C', '#FFFFFF'],
+  'Valencia': ['#EE3524', '#000000'],
+  'Athletic Bilbao': ['#EE2523', '#000000'],
+  'Villarreal': ['#FFE667', '#005187'],
+
+  // İTALYA SERIE A
+  'Juventus': ['#000000', '#FFFFFF'],
+  'AC Milan': ['#FB090B', '#000000'],
+  'Inter Milan': ['#0068A8', '#000000'],
+  'Inter': ['#0068A8', '#000000'],
+  'Napoli': ['#007FFF', '#FFFFFF'],
+  'Roma': ['#8B0304', '#F7B500'],
+  'AS Roma': ['#8B0304', '#F7B500'],
+  'Lazio': ['#87CEEB', '#FFFFFF'],
+
+  // ALMANYA BUNDESLIGA
+  'Bayern Munich': ['#DC052D', '#0066B2'],
+  'Bayern München': ['#DC052D', '#0066B2'],
+  'Bayern': ['#DC052D', '#0066B2'],
+  'Borussia Dortmund': ['#FDE100', '#000000'],
+  'Dortmund': ['#FDE100', '#000000'],
+  'RB Leipzig': ['#DD0741', '#FFFFFF'],
+  'Leipzig': ['#DD0741', '#FFFFFF'],
+  'Bayer Leverkusen': ['#E32221', '#000000'],
+
+  // FRANSA LIGUE 1
+  'PSG': ['#004170', '#DA291C'],
+  'Paris Saint-Germain': ['#004170', '#DA291C'],
+  'Paris SG': ['#004170', '#DA291C'],
+  'Lyon': ['#BE0E2C', '#0E2B5C'],
+  'Marseille': ['#2FAEE0', '#FFFFFF'],
+  'Monaco': ['#C8102E', '#FFFFFF'],
+
+  // PORTEKİZ
+  'Porto': ['#003C7E', '#FFFFFF'],
+  'FC Porto': ['#003C7E', '#FFFFFF'],
+  'Benfica': ['#D20222', '#FFFFFF'],
+  'Sporting': ['#095D41', '#FFFFFF'],
+  'Sporting CP': ['#095D41', '#FFFFFF'],
+
+  // HOLLANDA
+  'Ajax': ['#D2122E', '#FFFFFF'],
+  'PSV': ['#ED1C24', '#FFFFFF'],
+  'PSV Eindhoven': ['#ED1C24', '#FFFFFF'],
+  'Feyenoord': ['#CC0000', '#FFFFFF'],
+
+  // İSKOÇYA
+  'Celtic': ['#009B48', '#FFFFFF'],
+  'Celtic FC': ['#009B48', '#FFFFFF'],
+  'Rangers': ['#0F47AF', '#C8102E'],
+  'Rangers FC': ['#0F47AF', '#C8102E']
+};
+
+// Get team colors from database by team name
+function getTeamColorsFromDatabase(teamName) {
+  if (!teamName) return null;
+  
+  // Takım adını normalize et (case-insensitive)
+  const normalizedName = teamName.trim();
+  
+  // Önce database'e bak
+  if (TEAM_COLORS[normalizedName]) {
+    return TEAM_COLORS[normalizedName];
+  }
+  
+  // Case-insensitive arama
+  const lowerName = normalizedName.toLowerCase();
+  for (const [key, colors] of Object.entries(TEAM_COLORS)) {
+    if (key.toLowerCase() === lowerName) {
+      return colors;
+    }
+  }
+  
+  // Bulamazsa null döndür (logo extraction kullanılacak)
+  return null;
+}
+
+// Extract colors from logo URL (fallback)
+async function extractColorsFromLogo(logoUrl) {
   try {
     const colors = await getColors(logoUrl);
     return colors.slice(0, 2).map(c => c.hex());
@@ -76,6 +191,23 @@ async function getTeamColors(logoUrl) {
     console.error('Color extract error:', error);
     return ['#10B981', '#3B82F6']; // Default yeşil-mavi
   }
+}
+
+// Get team colors - tries database first, then logo extraction
+async function getTeamColors(teamName, logoUrl) {
+  // First try database
+  const dbColors = getTeamColorsFromDatabase(teamName);
+  if (dbColors) {
+    return dbColors;
+  }
+  
+  // Fallback to logo extraction if logo URL provided
+  if (logoUrl) {
+    return await extractColorsFromLogo(logoUrl);
+  }
+  
+  // Default colors if nothing found
+  return ['#10B981', '#3B82F6'];
 }
 
 async function initDatabase() {
@@ -369,14 +501,10 @@ app.get('/api/predictions', async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM predictions ORDER BY created_at DESC');
     
-    // Her prediction için renk çıkar
+    // Her prediction için renk çıkar - database'den önce, sonra logo'dan
     for (const pred of result.rows) {
-      if (pred.home_logo) {
-        pred.home_colors = await getTeamColors(pred.home_logo);
-      }
-      if (pred.away_logo) {
-        pred.away_colors = await getTeamColors(pred.away_logo);
-      }
+      pred.home_colors = await getTeamColors(pred.home_team, pred.home_logo);
+      pred.away_colors = await getTeamColors(pred.away_team, pred.away_logo);
     }
     
     res.json({ success: true, count: result.rows.length, predictions: result.rows });
@@ -393,14 +521,10 @@ app.get('/api/predictions/active', async (req, res) => {
       ['active']
     );
     
-    // Her prediction için renk çıkar
+    // Her prediction için renk çıkar - database'den önce, sonra logo'dan
     for (const pred of result.rows) {
-      if (pred.home_logo) {
-        pred.home_colors = await getTeamColors(pred.home_logo);
-      }
-      if (pred.away_logo) {
-        pred.away_colors = await getTeamColors(pred.away_logo);
-      }
+      pred.home_colors = await getTeamColors(pred.home_team, pred.home_logo);
+      pred.away_colors = await getTeamColors(pred.away_team, pred.away_logo);
     }
     
     res.json({ success: true, predictions: result.rows });
@@ -417,14 +541,10 @@ app.get('/api/predictions/completed', async (req, res) => {
       ['completed']
     );
     
-    // Her prediction için renk çıkar
+    // Her prediction için renk çıkar - database'den önce, sonra logo'dan
     for (const pred of result.rows) {
-      if (pred.home_logo) {
-        pred.home_colors = await getTeamColors(pred.home_logo);
-      }
-      if (pred.away_logo) {
-        pred.away_colors = await getTeamColors(pred.away_logo);
-      }
+      pred.home_colors = await getTeamColors(pred.home_team, pred.home_logo);
+      pred.away_colors = await getTeamColors(pred.away_team, pred.away_logo);
     }
     
     res.json({ success: true, predictions: result.rows });
@@ -480,7 +600,17 @@ app.post('/api/predictions', async (req, res) => {
       [match_id, home_team, away_team, league, prediction_type, oddsValue, confidence || 'orta', home_logo || null, away_logo || null, league_flag || null, league_logo || null, home_score || 0, away_score || 0, isUrgentValue]
     );
 
-    res.status(201).json({ success: true, prediction: result.rows[0] });
+    const prediction = result.rows[0];
+    
+    // Get team colors - try database first, then logo extraction
+    const homeColors = await getTeamColors(home_team, home_logo);
+    const awayColors = await getTeamColors(away_team, away_logo);
+    
+    // Add colors to prediction object
+    prediction.home_colors = homeColors;
+    prediction.away_colors = awayColors;
+
+    res.status(201).json({ success: true, prediction: prediction });
   } catch (error) {
     console.error('❌ Create:', error);
     res.status(500).json({ success: false, error: 'Failed' });
