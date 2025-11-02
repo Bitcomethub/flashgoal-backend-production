@@ -210,149 +210,84 @@ async function getTeamColors(teamName, logoUrl) {
   return ['#10B981', '#3B82F6'];
 }
 
-// ==========================================
-// LEAGUE FLAGS DATABASE
-// ==========================================
-
-const LEAGUE_FLAGS = {
-  // Türkiye
-  'Turkey': '🇹🇷',
-  'Süper Lig': '🇹🇷',
-  'Super Lig': '🇹🇷',
-
-  // Avrupa - Büyükler
-  'England': '🏴󠁧󠁢󠁥󠁮󠁧󠁿',
-  'Premier League': '🏴󠁧󠁢󠁥󠁮󠁧󠁿',
-  'Spain': '🇪🇸',
-  'La Liga': '🇪🇸',
-  'LaLiga': '🇪🇸',
-  'Italy': '🇮🇹',
-  'Serie A': '🇮🇹',
-  'Germany': '🇩🇪',
-  'Bundesliga': '🇩🇪',
-  'France': '🇫🇷',
-  'Ligue 1': '🇫🇷',
-
-  // Avrupa - Diğer
-  'Portugal': '🇵🇹',
-  'Primeira Liga': '🇵🇹',
-  'Netherlands': '🇳🇱',
-  'Eredivisie': '🇳🇱',
-  'Belgium': '🇧🇪',
-  'Scotland': '🏴󠁧󠁢󠁳󠁣󠁴󠁿',
-  'Greece': '🇬🇷',
-  'Austria': '🇦🇹',
-  'Switzerland': '🇨🇭',
-  'Denmark': '🇩🇰',
-  'Sweden': '🇸🇪',
-  'Norway': '🇳🇴',
-  'Poland': '🇵🇱',
-  'Czech Republic': '🇨🇿',
-  'Croatia': '🇭🇷',
-  'Serbia': '🇷🇸',
-  'Romania': '🇷🇴',
-  'Bulgaria': '🇧🇬',
-
-  // Senin eklediğin ülkeler
-  'Malta': '🇲🇹',
-  'Senegal': '🇸🇳',
-  'Mauritania': '🇲🇷',
-  'Morocco': '🇲🇦',
-  'Rwanda': '🇷🇼',
-  'Costa Rica': '🇨🇷',
-  'Cyprus': '🇨🇾',
-  'Guatemala': '🇬🇹',
-  'Bosnia': '🇧🇦',
-  'Bosnia and Herzegovina': '🇧🇦',
-  'Slovenia': '🇸🇮',
-  'Slovakia': '🇸🇰',
-  'Hungary': '🇭🇺',
-  'Belarus': '🇧🇾',
-  'Peru': '🇵🇪',
-  'Chile': '🇨🇱',
-  'Ecuador': '🇪🇨',
-  'Algeria': '🇩🇿',
-  'Egypt': '🇪🇬',
-  'Andorra': '🇦🇩',
-  'Israel': '🇮🇱',
-
-  // Dünya kupası
-  'World Cup': '🏆',
-  'FIFA World Cup': '🏆',
-  'Champions League': '🏆',
-  'UEFA Champions League': '🏆',
-  'Europa League': '🏆',
-  'Conference League': '🏆',
-
-  // Amerika
-  'USA': '🇺🇸',
-  'MLS': '🇺🇸',
-  'Brazil': '🇧🇷',
-  'Argentina': '🇦🇷',
-  'Mexico': '🇲🇽',
-  'Colombia': '🇨🇴',
-  'Uruguay': '🇺🇾',
-
-  // Asya
-  'Japan': '🇯🇵',
-  'South Korea': '🇰🇷',
-  'China': '🇨🇳',
-  'Saudi Arabia': '🇸🇦',
-  'UAE': '🇦🇪',
-  'Qatar': '🇶🇦',
-  'Australia': '🇦🇺'
-};
-
-// Get league flag from database by league name
+// Get league flag from league name
 function getLeagueFlag(leagueName) {
   if (!leagueName) return '🌍';
   
-  // Önce tam eşleşme
-  if (LEAGUE_FLAGS[leagueName]) {
-    return LEAGUE_FLAGS[leagueName];
+  const normalizedLeague = leagueName.toLowerCase().trim();
+  
+  // Türkiye Süper Lig
+  if (normalizedLeague.includes('türkiye') || normalizedLeague.includes('turkiye') || 
+      normalizedLeague.includes('süper lig') || normalizedLeague.includes('super lig') ||
+      normalizedLeague.includes('superliga') || normalizedLeague.includes('turkish')) {
+    return '🇹🇷';
   }
   
-  // Kısmi eşleşme (lig adı içinde ülke adı varsa)
-  const lowerLeague = leagueName.toLowerCase();
-  for (const [key, flag] of Object.entries(LEAGUE_FLAGS)) {
-    if (lowerLeague.includes(key.toLowerCase())) {
-      return flag;
-    }
+  // İngiltere Premier League
+  if (normalizedLeague.includes('premier') || normalizedLeague.includes('premier league') ||
+      normalizedLeague.includes('english') || normalizedLeague.includes('ingiltere')) {
+    return '🇬🇧';
   }
   
-  // Bulamazsa default
+  // İspanya La Liga
+  if (normalizedLeague.includes('la liga') || normalizedLeague.includes('spain') ||
+      normalizedLeague.includes('ispanya') || normalizedLeague.includes('spanish')) {
+    return '🇪🇸';
+  }
+  
+  // İtalya Serie A
+  if (normalizedLeague.includes('serie a') || normalizedLeague.includes('seriea') ||
+      normalizedLeague.includes('italy') || normalizedLeague.includes('italya') ||
+      normalizedLeague.includes('italian')) {
+    return '🇮🇹';
+  }
+  
+  // Almanya Bundesliga
+  if (normalizedLeague.includes('bundesliga') || normalizedLeague.includes('germany') ||
+      normalizedLeague.includes('almanya') || normalizedLeague.includes('german')) {
+    return '🇩🇪';
+  }
+  
+  // Fransa Ligue 1
+  if (normalizedLeague.includes('ligue 1') || normalizedLeague.includes('ligue1') ||
+      normalizedLeague.includes('france') || normalizedLeague.includes('fransa') ||
+      normalizedLeague.includes('french')) {
+    return '🇫🇷';
+  }
+  
+  // Portekiz
+  if (normalizedLeague.includes('portugal') || normalizedLeague.includes('portekiz') ||
+      normalizedLeague.includes('primeira liga') || normalizedLeague.includes('portuguese')) {
+    return '🇵🇹';
+  }
+  
+  // Hollanda
+  if (normalizedLeague.includes('eredivisie') || normalizedLeague.includes('holland') ||
+      normalizedLeague.includes('hollanda') || normalizedLeague.includes('netherlands') ||
+      normalizedLeague.includes('dutch')) {
+    return '🇳🇱';
+  }
+  
+  // İskoçya
+  if (normalizedLeague.includes('scotland') || normalizedLeague.includes('iskocya') ||
+      normalizedLeague.includes('scottish') || normalizedLeague.includes('premiership')) {
+    return '🇬🇧';
+  }
+  
+  // Şampiyonlar Ligi
+  if (normalizedLeague.includes('champions league') || normalizedLeague.includes('ucl') ||
+      normalizedLeague.includes('şampiyonlar')) {
+    return '🏆';
+  }
+  
+  // Avrupa Ligi
+  if (normalizedLeague.includes('europa league') || normalizedLeague.includes('uel') ||
+      normalizedLeague.includes('avrupa ligi')) {
+    return '🇪🇺';
+  }
+  
+  // Default fallback
   return '🌍';
-}
-
-// ==========================================
-// FLAG URL TO EMOJI CONVERSION
-// ==========================================
-
-const FLAG_URL_TO_EMOJI = {
-  'no': '🇳🇴', 'tr': '🇹🇷', 'gb-eng': '🏴󠁧󠁢󠁥󠁮󠁧󠁿', 'gb': '🇬🇧',
-  'es': '🇪🇸', 'it': '🇮🇹', 'de': '🇩🇪', 'fr': '🇫🇷', 'pt': '🇵🇹',
-  'nl': '🇳🇱', 'be': '🇧🇪', 'gr': '🇬🇷', 'at': '🇦🇹', 'ch': '🇨🇭',
-  'dk': '🇩🇰', 'se': '🇸🇪', 'pl': '🇵🇱', 'cz': '🇨🇿', 'hr': '🇭🇷',
-  'rs': '🇷🇸', 'ro': '🇷🇴', 'bg': '🇧🇬', 'mt': '🇲🇹', 'sn': '🇸🇳',
-  'mr': '🇲🇷', 'ma': '🇲🇦', 'rw': '🇷🇼', 'cr': '🇨🇷', 'cy': '🇨🇾',
-  'gt': '🇬🇹', 'ba': '🇧🇦', 'si': '🇸🇮', 'sk': '🇸🇰', 'hu': '🇭🇺',
-  'by': '🇧🇾', 'pe': '🇵🇪', 'cl': '🇨🇱', 'ec': '🇪🇨', 'dz': '🇩🇿',
-  'eg': '🇪🇬', 'ad': '🇦🇩', 'il': '🇮🇱', 'us': '🇺🇸', 'br': '🇧🇷',
-  'ar': '🇦🇷', 'mx': '🇲🇽', 'jp': '🇯🇵', 'kr': '🇰🇷', 'cn': '🇨🇳',
-  'sa': '🇸🇦', 'ae': '🇦🇪', 'qa': '🇶🇦', 'au': '🇦🇺', 'uy': '🇺🇾',
-  'co': '🇨🇴', 'gb-sct': '🏴󠁧󠁢󠁳󠁣󠁴󠁿', 'ie': '🇮🇪', 'fi': '🇫🇮'
-};
-
-// Convert flag URL to emoji
-function flagUrlToEmoji(flagUrl) {
-  if (!flagUrl || typeof flagUrl !== 'string') return '🌍';
-  
-  // URL'den country code çıkar: ".../no.svg" → "no"
-  const match = flagUrl.match(/\/([a-z-]+)\.(svg|png)$/i);
-  if (!match) return '🌍';
-  
-  const countryCode = match[1].toLowerCase();
-  return FLAG_URL_TO_EMOJI[countryCode] || '🌍';
 }
 
 async function initDatabase() {
@@ -548,22 +483,7 @@ app.get('/api/matches/live', async (req, res) => {
     });
 
     const matches = response.data.response;
-    
-    // Convert flag URLs to emojis
-    const matchesWithFlags = matches.map(match => {
-      if (match.league && match.league.flag) {
-        return {
-          ...match,
-          league: {
-            ...match.league,
-            flag: flagUrlToEmoji(match.league.flag)
-          }
-        };
-      }
-      return match;
-    });
-    
-    res.json({ success: true, count: matchesWithFlags.length, matches: matchesWithFlags });
+    res.json({ success: true, count: matches.length, matches: matches });
   } catch (error) {
     console.error('❌ Live matches:', error.message);
     res.status(500).json({ success: false, error: 'Failed to fetch' });
@@ -701,10 +621,15 @@ app.get('/api/predictions/completed', async (req, res) => {
       ['completed']
     );
     
-    // Her prediction için renk çıkar - database'den önce, sonra logo'dan
+    // Her prediction için renk çıkar ve league_flag'i düzelt
     for (const pred of result.rows) {
       pred.home_colors = await getTeamColors(pred.home_team, pred.home_logo);
       pred.away_colors = await getTeamColors(pred.away_team, pred.away_logo);
+      
+      // Database'de kaydedilen flag'i override et - eğer 🌍 ise league adından belirle
+      pred.league_flag = pred.league_flag === '🌍' || !pred.league_flag
+        ? getLeagueFlag(pred.league)
+        : pred.league_flag;
     }
     
     res.json({ success: true, predictions: result.rows });
@@ -751,16 +676,13 @@ app.post('/api/predictions', async (req, res) => {
 
     const oddsValue = odds && !isNaN(parseFloat(odds)) ? parseFloat(odds) : 0;
     const isUrgentValue = is_urgent === true || is_urgent === 'true';
-    
-    // Get league flag automatically if not provided
-    const finalLeagueFlag = league_flag || getLeagueFlag(league);
 
     const result = await pool.query(
       `INSERT INTO predictions 
        (match_id, home_team, away_team, league, prediction_type, odds, confidence, status, home_logo, away_logo, league_flag, league_logo, home_score, away_score, is_urgent) 
        VALUES ($1, $2, $3, $4, $5, $6, $7, 'active', $8, $9, $10, $11, $12, $13, $14) 
        RETURNING *`,
-      [match_id, home_team, away_team, league, prediction_type, oddsValue, confidence || 'orta', home_logo || null, away_logo || null, finalLeagueFlag || null, league_logo || null, home_score || 0, away_score || 0, isUrgentValue]
+      [match_id, home_team, away_team, league, prediction_type, oddsValue, confidence || 'orta', home_logo || null, away_logo || null, league_flag || null, league_logo || null, home_score || 0, away_score || 0, isUrgentValue]
     );
 
     const prediction = result.rows[0];
