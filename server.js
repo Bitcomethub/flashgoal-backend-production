@@ -210,80 +210,138 @@ async function getTeamColors(teamName, logoUrl) {
   return ['#10B981', '#3B82F6'];
 }
 
+// League and country flag mapping
+const LEAGUE_FLAGS = {
+  // League names
+  'premier league': '🇬🇧',
+  'premier': '🇬🇧',
+  'la liga': '🇪🇸',
+  'serie a': '🇮🇹',
+  'serie b': '🇮🇹',
+  'bundesliga': '🇩🇪',
+  'ligue 1': '🇫🇷',
+  'ligue 2': '🇫🇷',
+  'super lig': '🇹🇷',
+  'süper lig': '🇹🇷',
+  'superliga': '🇹🇷',
+  'primeira liga': '🇵🇹',
+  'eredivisie': '🇳🇱',
+  'champions league': '🏆',
+  'europa league': '🇪🇺',
+  'ucl': '🏆',
+  'uel': '🇪🇺',
+  
+  // Countries
+  'turkey': '🇹🇷',
+  'türkiye': '🇹🇷',
+  'turkiye': '🇹🇷',
+  'turkish': '🇹🇷',
+  'england': '🇬🇧',
+  'english': '🇬🇧',
+  'ingiltere': '🇬🇧',
+  'spain': '🇪🇸',
+  'ispanya': '🇪🇸',
+  'spanish': '🇪🇸',
+  'italy': '🇮🇹',
+  'italya': '🇮🇹',
+  'italian': '🇮🇹',
+  'germany': '🇩🇪',
+  'almanya': '🇩🇪',
+  'german': '🇩🇪',
+  'france': '🇫🇷',
+  'fransa': '🇫🇷',
+  'french': '🇫🇷',
+  'portugal': '🇵🇹',
+  'portekiz': '🇵🇹',
+  'portuguese': '🇵🇹',
+  'netherlands': '🇳🇱',
+  'holland': '🇳🇱',
+  'hollanda': '🇳🇱',
+  'dutch': '🇳🇱',
+  'scotland': '🇬🇧',
+  'iskocya': '🇬🇧',
+  'scottish': '🇬🇧',
+  'hungary': '🇭🇺',
+  'macaristan': '🇭🇺',
+  'hungarian': '🇭🇺',
+  'brazil': '🇧🇷',
+  'brezilya': '🇧🇷',
+  'brazilian': '🇧🇷',
+  'argentina': '🇦🇷',
+  'arjantin': '🇦🇷',
+  'argentinian': '🇦🇷',
+  'mexico': '🇲🇽',
+  'meksika': '🇲🇽',
+  'mexican': '🇲🇽',
+  'usa': '🇺🇸',
+  'united states': '🇺🇸',
+  'america': '🇺🇸',
+  'russia': '🇷🇺',
+  'rusya': '🇷🇺',
+  'russian': '🇷🇺',
+  'poland': '🇵🇱',
+  'polonya': '🇵🇱',
+  'polish': '🇵🇱',
+  'czech': '🇨🇿',
+  'czech republic': '🇨🇿',
+  'greece': '🇬🇷',
+  'yunanistan': '🇬🇷',
+  'greek': '🇬🇷',
+  'belgium': '🇧🇪',
+  'belcika': '🇧🇪',
+  'belgian': '🇧🇪',
+  'austria': '🇦🇹',
+  'avusturya': '🇦🇹',
+  'austrian': '🇦🇹',
+  'switzerland': '🇨🇭',
+  'isvicre': '🇨🇭',
+  'swiss': '🇨🇭',
+  'croatia': '🇭🇷',
+  'hrvatska': '🇭🇷',
+  'croatian': '🇭🇷',
+  'serbia': '🇷🇸',
+  'sirbistan': '🇷🇸',
+  'serbian': '🇷🇸',
+  'romania': '🇷🇴',
+  'romanya': '🇷🇴',
+  'romanian': '🇷🇴',
+  'ukraine': '🇺🇦',
+  'ukrayna': '🇺🇦',
+  'ukrainian': '🇺🇦'
+};
+
 // Get league flag from league name
 function getLeagueFlag(leagueName) {
   if (!leagueName) return '🌍';
   
   const normalizedLeague = leagueName.toLowerCase().trim();
   
-  // Türkiye Süper Lig
-  if (normalizedLeague.includes('türkiye') || normalizedLeague.includes('turkiye') || 
-      normalizedLeague.includes('süper lig') || normalizedLeague.includes('super lig') ||
-      normalizedLeague.includes('superliga') || normalizedLeague.includes('turkish')) {
-    return '🇹🇷';
+  // Önce tam eşleşme kontrolü
+  if (LEAGUE_FLAGS[normalizedLeague]) {
+    return LEAGUE_FLAGS[normalizedLeague];
   }
   
-  // İngiltere Premier League
-  if (normalizedLeague.includes('premier') || normalizedLeague.includes('premier league') ||
-      normalizedLeague.includes('english') || normalizedLeague.includes('ingiltere')) {
-    return '🇬🇧';
+  // " - Country" formatını kontrol et (örn: "NB I - Hungary", "Serie B - Brazil")
+  // Bu format daha spesifik olduğu için kısmi eşleşmeden önce kontrol edilmeli
+  if (normalizedLeague.includes(' - ')) {
+    const parts = normalizedLeague.split(' - ');
+    if (parts.length >= 2) {
+      const country = parts[1].trim(); // "Hungary", "Brazil"
+      
+      // Ülke adına göre flag ara
+      for (const [key, flag] of Object.entries(LEAGUE_FLAGS)) {
+        if (country.includes(key.toLowerCase()) || key.toLowerCase().includes(country)) {
+          return flag;
+        }
+      }
+    }
   }
   
-  // İspanya La Liga
-  if (normalizedLeague.includes('la liga') || normalizedLeague.includes('spain') ||
-      normalizedLeague.includes('ispanya') || normalizedLeague.includes('spanish')) {
-    return '🇪🇸';
-  }
-  
-  // İtalya Serie A
-  if (normalizedLeague.includes('serie a') || normalizedLeague.includes('seriea') ||
-      normalizedLeague.includes('italy') || normalizedLeague.includes('italya') ||
-      normalizedLeague.includes('italian')) {
-    return '🇮🇹';
-  }
-  
-  // Almanya Bundesliga
-  if (normalizedLeague.includes('bundesliga') || normalizedLeague.includes('germany') ||
-      normalizedLeague.includes('almanya') || normalizedLeague.includes('german')) {
-    return '🇩🇪';
-  }
-  
-  // Fransa Ligue 1
-  if (normalizedLeague.includes('ligue 1') || normalizedLeague.includes('ligue1') ||
-      normalizedLeague.includes('france') || normalizedLeague.includes('fransa') ||
-      normalizedLeague.includes('french')) {
-    return '🇫🇷';
-  }
-  
-  // Portekiz
-  if (normalizedLeague.includes('portugal') || normalizedLeague.includes('portekiz') ||
-      normalizedLeague.includes('primeira liga') || normalizedLeague.includes('portuguese')) {
-    return '🇵🇹';
-  }
-  
-  // Hollanda
-  if (normalizedLeague.includes('eredivisie') || normalizedLeague.includes('holland') ||
-      normalizedLeague.includes('hollanda') || normalizedLeague.includes('netherlands') ||
-      normalizedLeague.includes('dutch')) {
-    return '🇳🇱';
-  }
-  
-  // İskoçya
-  if (normalizedLeague.includes('scotland') || normalizedLeague.includes('iskocya') ||
-      normalizedLeague.includes('scottish') || normalizedLeague.includes('premiership')) {
-    return '🇬🇧';
-  }
-  
-  // Şampiyonlar Ligi
-  if (normalizedLeague.includes('champions league') || normalizedLeague.includes('ucl') ||
-      normalizedLeague.includes('şampiyonlar')) {
-    return '🏆';
-  }
-  
-  // Avrupa Ligi
-  if (normalizedLeague.includes('europa league') || normalizedLeague.includes('uel') ||
-      normalizedLeague.includes('avrupa ligi')) {
-    return '🇪🇺';
+  // Kısmi eşleşme - league/ülke adını ara
+  for (const [key, flag] of Object.entries(LEAGUE_FLAGS)) {
+    if (normalizedLeague.includes(key.toLowerCase())) {
+      return flag;
+    }
   }
   
   // Default fallback
