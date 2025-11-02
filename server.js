@@ -324,6 +324,37 @@ function getLeagueFlag(leagueName) {
   return '🌍';
 }
 
+// ==========================================
+// FLAG URL TO EMOJI CONVERSION
+// ==========================================
+
+const FLAG_URL_TO_EMOJI = {
+  'no': '🇳🇴', 'tr': '🇹🇷', 'gb-eng': '🏴󠁧󠁢󠁥󠁮󠁧󠁿', 'gb': '🇬🇧',
+  'es': '🇪🇸', 'it': '🇮🇹', 'de': '🇩🇪', 'fr': '🇫🇷', 'pt': '🇵🇹',
+  'nl': '🇳🇱', 'be': '🇧🇪', 'gr': '🇬🇷', 'at': '🇦🇹', 'ch': '🇨🇭',
+  'dk': '🇩🇰', 'se': '🇸🇪', 'pl': '🇵🇱', 'cz': '🇨🇿', 'hr': '🇭🇷',
+  'rs': '🇷🇸', 'ro': '🇷🇴', 'bg': '🇧🇬', 'mt': '🇲🇹', 'sn': '🇸🇳',
+  'mr': '🇲🇷', 'ma': '🇲🇦', 'rw': '🇷🇼', 'cr': '🇨🇷', 'cy': '🇨🇾',
+  'gt': '🇬🇹', 'ba': '🇧🇦', 'si': '🇸🇮', 'sk': '🇸🇰', 'hu': '🇭🇺',
+  'by': '🇧🇾', 'pe': '🇵🇪', 'cl': '🇨🇱', 'ec': '🇪🇨', 'dz': '🇩🇿',
+  'eg': '🇪🇬', 'ad': '🇦🇩', 'il': '🇮🇱', 'us': '🇺🇸', 'br': '🇧🇷',
+  'ar': '🇦🇷', 'mx': '🇲🇽', 'jp': '🇯🇵', 'kr': '🇰🇷', 'cn': '🇨🇳',
+  'sa': '🇸🇦', 'ae': '🇦🇪', 'qa': '🇶🇦', 'au': '🇦🇺', 'uy': '🇺🇾',
+  'co': '🇨🇴', 'gb-sct': '🏴󠁧󠁢󠁳󠁣󠁴󠁿', 'ie': '🇮🇪', 'fi': '🇫🇮'
+};
+
+// Convert flag URL to emoji
+function flagUrlToEmoji(flagUrl) {
+  if (!flagUrl || typeof flagUrl !== 'string') return '🌍';
+  
+  // URL'den country code çıkar: ".../no.svg" → "no"
+  const match = flagUrl.match(/\/([a-z-]+)\.(svg|png)$/i);
+  if (!match) return '🌍';
+  
+  const countryCode = match[1].toLowerCase();
+  return FLAG_URL_TO_EMOJI[countryCode] || '🌍';
+}
+
 async function initDatabase() {
   try {
     await pool.query('SELECT NOW()');
@@ -517,7 +548,22 @@ app.get('/api/matches/live', async (req, res) => {
     });
 
     const matches = response.data.response;
-    res.json({ success: true, count: matches.length, matches: matches });
+    
+    // Convert flag URLs to emojis
+    const matchesWithFlags = matches.map(match => {
+      if (match.league && match.league.flag) {
+        return {
+          ...match,
+          league: {
+            ...match.league,
+            flag: flagUrlToEmoji(match.league.flag)
+          }
+        };
+      }
+      return match;
+    });
+    
+    res.json({ success: true, count: matchesWithFlags.length, matches: matchesWithFlags });
   } catch (error) {
     console.error('❌ Live matches:', error.message);
     res.status(500).json({ success: false, error: 'Failed to fetch' });
