@@ -1,6 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const path = require('path');
 const { Pool } = require('pg');
 const axios = require('axios');
 const cron = require("node-cron");
@@ -21,6 +22,9 @@ app.use(cors({
 app.options('*', cors());
 
 app.use(express.json());
+
+// Static files middleware - CORS ve body-parser'dan sonra, routes'tan ÖNCE
+app.use('/static', express.static(path.join(__dirname, 'public')));
 
 // Rate limiting için basit memory store
 const rateLimitStore = new Map();
