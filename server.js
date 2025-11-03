@@ -307,7 +307,13 @@ const LEAGUE_FLAGS = {
   'romanian': '🇷🇴',
   'ukraine': '🇺🇦',
   'ukrayna': '🇺🇦',
-  'ukrainian': '🇺🇦'
+  'ukrainian': '🇺🇦',
+  'sweden': '🇸🇪',
+  'isvec': '🇸🇪',
+  'swedish': '🇸🇪',
+  'chile': '🇨🇱',
+  'sili': '🇨🇱',
+  'chilean': '🇨🇱'
 };
 
 // Get league flag from league name
@@ -326,11 +332,18 @@ function getLeagueFlag(leagueName) {
   if (normalizedLeague.includes(' - ')) {
     const parts = normalizedLeague.split(' - ');
     if (parts.length >= 2) {
-      const country = parts[1].trim(); // "Hungary", "Brazil"
+      const country = parts[1].trim(); // "hungary", "brazil" (zaten lowercase)
       
-      // Ülke adına göre flag ara
+      // Önce tam eşleşme kontrolü
+      if (LEAGUE_FLAGS[country]) {
+        return LEAGUE_FLAGS[country];
+      }
+      
+      // Ülke adına göre flag ara - tam eşleşme veya kısmi eşleşme
       for (const [key, flag] of Object.entries(LEAGUE_FLAGS)) {
-        if (country.includes(key.toLowerCase()) || key.toLowerCase().includes(country)) {
+        const lowerKey = key.toLowerCase();
+        // Tam eşleşme veya country key'in içinde geçiyorsa
+        if (country === lowerKey || country.includes(lowerKey) || lowerKey.includes(country)) {
           return flag;
         }
       }
