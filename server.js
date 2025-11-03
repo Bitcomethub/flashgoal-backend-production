@@ -652,10 +652,15 @@ app.get('/api/predictions', async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM predictions ORDER BY created_at DESC');
     
-    // Her prediction için renk çıkar - database'den önce, sonra logo'dan
+    // Her prediction için renk çıkar ve league_flag'i düzelt
     for (const pred of result.rows) {
       pred.home_colors = await getTeamColors(pred.home_team, pred.home_logo);
       pred.away_colors = await getTeamColors(pred.away_team, pred.away_logo);
+      
+      // League flag düzelt
+      if (!pred.league_flag || pred.league_flag === '🌍') {
+        pred.league_flag = getLeagueFlag(pred.league);
+      }
     }
     
     res.json({ success: true, count: result.rows.length, predictions: result.rows });
@@ -672,10 +677,15 @@ app.get('/api/predictions/active', async (req, res) => {
       ['active']
     );
     
-    // Her prediction için renk çıkar - database'den önce, sonra logo'dan
+    // Her prediction için renk çıkar ve league_flag'i düzelt
     for (const pred of result.rows) {
       pred.home_colors = await getTeamColors(pred.home_team, pred.home_logo);
       pred.away_colors = await getTeamColors(pred.away_team, pred.away_logo);
+      
+      // League flag düzelt
+      if (!pred.league_flag || pred.league_flag === '🌍') {
+        pred.league_flag = getLeagueFlag(pred.league);
+      }
     }
     
     res.json({ success: true, predictions: result.rows });
