@@ -6,6 +6,10 @@ const { Pool } = require('pg');
 const axios = require('axios');
 const cron = require("node-cron");
 const getColors = require('get-image-colors');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const nodemailer = require('nodemailer');
+const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -66,6 +70,18 @@ const rateLimitBatch = (req, res, next) => {
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+});
+
+// JWT SECRET
+const JWT_SECRET = process.env.JWT_SECRET || 'flashgoal-secret-2025';
+
+// EMAIL TRANSPORTER
+const emailTransporter = nodemailer.createTransport({
+  service: 'gmail',
+  auth: {
+    user: process.env.EMAIL_USER || 'your-email@gmail.com',
+    pass: process.env.EMAIL_PASS || 'your-app-password'
+  }
 });
 
 // ==========================================
@@ -1507,6 +1523,228 @@ cron.schedule('*/10 * * * *', async () => {
     console.log('✅ [10MIN CRON] Cron job completed:', data);
   } catch (error) {
     console.error('❌ [10MIN CRON] Cron job failed:', error.message);
+  }
+});
+
+// ============================================
+// AUTH ENDPOINTS
+// ============================================
+
+// POST /api/auth/register
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const { email, password, name, referralCode } = req.body;
+    
+    if (!email || !password) {
+      return res.status(400).json({ success: false, error: 'Email and password required' });
+    }
+    
+    // Check if exists
+    const existing = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
+    if (existing.rows.length > 0) {
+      return res.status(400).json({ success: false, error: 'Email already registered' });
+    }
+    
+    // Hash password
+    const passwordHash = await bcrypt.hash(password, 10);
+    
+    // Generate referral code
+    const newReferralCode = crypto.randomBytes(4).toString('hex').toUpperCase();
+    
+    // Insert user
+    const result = await pool.query(
+      `INSERT INTO users (email, password_hash, name, referral_code, referred_by) 
+       VALUES ($1, $2, $3, $4, $5) 
+       RETURNING id, email, name, referral_code`,
+      [email, passwordHash, name, newReferralCode, referralCode]
+    );
+    
+    const user = result.rows[0];
+    
+    // Generate token
+    const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
+    
+    res.json({ 
+      success: true, 
+      token, 
+      userId: user.id,
+      user: { email: user.email, name: user.name }
+    });
+  } catch (error) {
+    console.error('Register error:', error);
+    res.status(500).json({ success: false, error: 'Registration failed' });
+  }
+});
+
+// POST /api/auth/login
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    
+    // Get user
+    const result = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+    
+    if (result.rows.length === 0) {
+      return res.status(401).json({ success: false, error: 'Invalid credentials' });
+    }
+    
+    const user = result.rows[0];
+    
+    // Check password
+    const valid = await bcrypt.compare(password, user.password_hash);
+    
+    if (!valid) {
+      return res.status(401).json({ success: false, error: 'Invalid credentials' });
+    }
+    
+    // Check VIP status
+    const vipCheck = await pool.query(
+      'SELECT * FROM vip_access WHERE user_id = $1 AND expiry_date > NOW()',
+      [user.id.toString()]
+    );
+    
+    const isVIP = vipCheck.rows.length > 0;
+    const vipExpiresAt = isVIP ? vipCheck.rows[0].expiry_date : null;
+    
+    // Generate token
+    const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
+    
+    res.json({ 
+      success: true, 
+      token, 
+      userId: user.id,
+      isVIP,
+      vipExpiresAt,
+      user: { email: user.email, name: user.name }
+    });
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({ success: false, error: 'Login failed' });
+  }
+});
+
+// GET /api/auth/validate
+app.get('/api/auth/validate', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    
+    if (!token) {
+      return res.json({ valid: false });
+    }
+    
+    const decoded = jwt.verify(token, JWT_SECRET);
+    
+    // Check if user still exists
+    const result = await pool.query('SELECT id FROM users WHERE id = $1', [decoded.userId]);
+    
+    if (result.rows.length === 0) {
+      return res.json({ valid: false });
+    }
+    
+    res.json({ valid: true, userId: decoded.userId });
+  } catch (error) {
+    res.json({ valid: false });
+  }
+});
+
+// POST /api/auth/forgot-password
+app.post('/api/auth/forgot-password', async (req, res) => {
+  try {
+    const { email } = req.body;
+    
+    const result = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+    
+    if (result.rows.length === 0) {
+      // Don't reveal if email exists
+      return res.json({ success: true });
+    }
+    
+    const user = result.rows[0];
+    
+    // Generate reset token
+    const resetToken = crypto.randomBytes(32).toString('hex');
+    const resetExpires = Date.now() + 15 * 60 * 1000; // 15 minutes
+    
+    await pool.query(
+      'UPDATE users SET reset_token = $1, reset_token_expires = $2 WHERE id = $3',
+      [resetToken, resetExpires, user.id]
+    );
+    
+    // Send email
+    const resetLink = `flashgoal://reset-password?token=${resetToken}`;
+    
+    await emailTransporter.sendMail({
+      to: email,
+      subject: 'FlashGoal - Şifre Sıfırlama',
+      html: `
+        <h2>Şifre Sıfırlama</h2>
+        <p>Şifrenizi sıfırlamak için aşağıdaki linke tıklayın:</p>
+        <a href="${resetLink}">Şifremi Sıfırla</a>
+        <p>Bu link 15 dakika geçerlidir.</p>
+      `
+    });
+    
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Forgot password error:', error);
+    res.status(500).json({ success: false, error: 'Failed to send reset email' });
+  }
+});
+
+// POST /api/auth/reset-password
+app.post('/api/auth/reset-password', async (req, res) => {
+  try {
+    const { token, newPassword } = req.body;
+    
+    const result = await pool.query(
+      'SELECT * FROM users WHERE reset_token = $1 AND reset_token_expires > $2',
+      [token, Date.now()]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(400).json({ success: false, error: 'Invalid or expired token' });
+    }
+    
+    const user = result.rows[0];
+    
+    // Hash new password
+    const passwordHash = await bcrypt.hash(newPassword, 10);
+    
+    await pool.query(
+      'UPDATE users SET password_hash = $1, reset_token = NULL, reset_token_expires = NULL WHERE id = $2',
+      [passwordHash, user.id]
+    );
+    
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Reset password error:', error);
+    res.status(500).json({ success: false, error: 'Failed to reset password' });
+  }
+});
+
+// GET /api/user/vip-status
+app.get('/api/user/vip-status', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    const decoded = jwt.verify(token, JWT_SECRET);
+    
+    const result = await pool.query(
+      'SELECT * FROM vip_access WHERE user_id = $1 AND expiry_date > NOW()',
+      [decoded.userId.toString()]
+    );
+    
+    if (result.rows.length > 0) {
+      const vip = result.rows[0];
+      res.json({
+        isVIP: true,
+        expiresAt: vip.expiry_date,
+        subscriptionType: vip.product_id
+      });
+    } else {
+      res.json({ isVIP: false });
+    }
+  } catch (error) {
+    res.status(401).json({ isVIP: false });
   }
 });
 
