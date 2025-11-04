@@ -912,9 +912,22 @@ app.get('/api/cron/update-scores', async (req, res) => {
         
         // 2. CANLİ MAÇTA ERKEN KAZANMA KONTROLÜ
         else if (isLive && pred.result === null) {
-          // İY tahminleri
+          // İY tahminleri - 1H'da da kontrol et
           if (predType.includes("İY") || predType.includes("IY")) {
-            if (statusShort === "HT" || statusShort === "2H") {
+            // 1H ise canlı skora bak (erken kazanma)
+            if (statusShort === "1H") {
+              const currentTotal = homeScore + awayScore;
+              if (predType.includes("0.5Ü") && currentTotal > 0.5) result = "won";
+              else if (predType.includes("1.5Ü") && currentTotal > 1.5) result = "won";
+              else if (predType.includes("2.5Ü") && currentTotal > 2.5) result = "won";
+              
+              if (result === "won") {
+                shouldUpdateResult = true;
+                shouldUpdateScore = true;
+              }
+            }
+            // HT/2H ise halftime skoruna bak (final sonuç)
+            else if (statusShort === "HT" || statusShort === "2H") {
               const htScore = fixture.score?.halftime;
               const htTotal = htScore ? (htScore.home || 0) + (htScore.away || 0) : 0;
               
@@ -1003,23 +1016,30 @@ app.get('/', (req, res) => {
   });
 });
 
-// Auto cleanup cron - every day at 3 AM
-cron.schedule("0 3 * * *", async () => {
+// Gece 00:00 Türkiye saati = 21:00 UTC
+cron.schedule("0 21 * * *", async () => {
   try {
-    const result = await pool.query(
-      `DELETE FROM predictions 
-       WHERE created_at < NOW() - INTERVAL '2 days' 
-       RETURNING id`
-    );
-    console.log(`🗑️ Auto cleanup: Deleted ${result.rowCount} old predictions`);
+    // Son 10 completed tahmin KAL, geri kalanı SİL
+    const result = await pool.query(`
+      DELETE FROM predictions 
+      WHERE id NOT IN (
+        SELECT id FROM predictions 
+        WHERE status = 'completed'
+        ORDER BY completed_at DESC NULLS LAST
+        LIMIT 10
+      )
+      AND status = 'completed'
+      RETURNING id
+    `);
+    console.log(`🗑️ Cleanup: Deleted ${result.rowCount} old completed predictions (kept last 10)`);
   } catch (error) {
-    console.error("❌ Auto cleanup error:", error.message);
+    console.error("❌ Cleanup error:", error.message);
   }
 });
 
 cron.schedule("*/30 * * * * *", async () => {
   try {
-    const { rows } = await pool.query("SELECT * FROM predictions WHERE status = 'active'");
+    const { rows } = await pool.query("SELECT * FROM predictions WHERE status IN ('active', 'completed')");
     
     for (const pred of rows) {
       try {
@@ -1059,51 +1079,85 @@ cron.schedule("*/30 * * * * *", async () => {
           shouldUpdateScore = true;
         }
         
-        // İY (İlk Yarı) tahminleri - HT'de kontrol et
+        // İY (İlk Yarı) tahminleri - 1H'da CANLI kontrol, HT'de FINAL kontrol
         if (predType.includes("İY") || predType.includes("IY")) {
-          if (isHT) {
-            if (predType.includes("0.5Ü")) result = htTotal > 0.5 ? "won" : "lost";
-            else if (predType.includes("1.5Ü")) result = htTotal > 1.5 ? "won" : "lost";
-            else if (predType.includes("2.5Ü")) result = htTotal > 2.5 ? "won" : "lost";
-            shouldUpdate = true;
+          const is1H = statusShort === "1H";
+          
+          // Sadece active tahminler için result belirle
+          if (pred.status === 'active') {
+            // 1H ise canlı skora bak (erken kazanma)
+            if (is1H) {
+              const currentTotal = homeScore + awayScore;
+              if (predType.includes("0.5Ü") && currentTotal > 0.5) {
+                result = "won";
+                shouldUpdate = true;
+              }
+              else if (predType.includes("1.5Ü") && currentTotal > 1.5) {
+                result = "won";
+                shouldUpdate = true;
+              }
+              else if (predType.includes("2.5Ü") && currentTotal > 2.5) {
+                result = "won";
+                shouldUpdate = true;
+              }
+            }
+            // HT/2H/FT ise halftime skoruna bak (final sonuç)
+            else if (isHT) {
+              if (predType.includes("0.5Ü")) result = htTotal > 0.5 ? "won" : "lost";
+              else if (predType.includes("1.5Ü")) result = htTotal > 1.5 ? "won" : "lost";
+              else if (predType.includes("2.5Ü")) result = htTotal > 2.5 ? "won" : "lost";
+              shouldUpdate = true;
+            }
           }
         } 
         // MB (Maç Boyu) tahminleri - Canlı maçta erken kazanma kontrolü
         else if (predType.includes("MB")) {
           const isLive = ["1H", "2H", "HT", "FT", "AET", "PEN"].includes(statusShort);
           
-          if (isLive) {
-            // MB tahminleri için erken kazanma kontrolü
-            if (predType.includes("0.5Ü")) {
-              if (total >= 1) result = "won"; // 0.5Ü için 1+ gol = kazandı
-              else if (isFinished) result = "lost"; // Maç bitti ve 0 gol = kaybetti
-            }
-            else if (predType.includes("1.5Ü")) {
-              if (total >= 2) result = "won"; // 1.5Ü için 2+ gol = kazandı
-              else if (isFinished) result = "lost"; // Maç bitti ve <2 gol = kaybetti
-            }
-            else if (predType.includes("2.5Ü")) {
-              if (total >= 3) result = "won"; // 2.5Ü için 3+ gol = kazandı
-              else if (isFinished) result = "lost"; // Maç bitti ve <3 gol = kaybetti
-            }
-            else if (predType.includes("3.5Ü")) {
-              if (total >= 4) result = "won"; // 3.5Ü için 4+ gol = kazandı
-              else if (isFinished) result = "lost"; // Maç bitti ve <4 gol = kaybetti
-            }
-            else if (predType.includes("4.5Ü")) {
-              if (total >= 5) result = "won"; // 4.5Ü için 5+ gol = kazandı
-              else if (isFinished) result = "lost"; // Maç bitti ve <5 gol = kaybetti
-            }
-            else if (predType.includes("KGV")) {
-              if (homeScore > 0 && awayScore > 0) result = "won"; // Her iki takım gol attı
-              else if (isFinished) result = "lost"; // Maç bitti ve bir takım gol atmadı
-            }
-            
-            // Eğer kazandıysa hemen güncelle, kaybetti ise sadece maç bittiyse güncelle
-            if (result === "won" || (result === "lost" && isFinished)) {
-              shouldUpdate = true;
+          // Sadece active tahminler için result belirle
+          if (pred.status === 'active') {
+            if (isLive) {
+              // MB tahminleri için erken kazanma kontrolü
+              if (predType.includes("0.5Ü")) {
+                if (total >= 1) result = "won"; // 0.5Ü için 1+ gol = kazandı
+                else if (isFinished) result = "lost"; // Maç bitti ve 0 gol = kaybetti
+              }
+              else if (predType.includes("1.5Ü")) {
+                if (total >= 2) result = "won"; // 1.5Ü için 2+ gol = kazandı
+                else if (isFinished) result = "lost"; // Maç bitti ve <2 gol = kaybetti
+              }
+              else if (predType.includes("2.5Ü")) {
+                if (total >= 3) result = "won"; // 2.5Ü için 3+ gol = kazandı
+                else if (isFinished) result = "lost"; // Maç bitti ve <3 gol = kaybetti
+              }
+              else if (predType.includes("3.5Ü")) {
+                if (total >= 4) result = "won"; // 3.5Ü için 4+ gol = kazandı
+                else if (isFinished) result = "lost"; // Maç bitti ve <4 gol = kaybetti
+              }
+              else if (predType.includes("4.5Ü")) {
+                if (total >= 5) result = "won"; // 4.5Ü için 5+ gol = kazandı
+                else if (isFinished) result = "lost"; // Maç bitti ve <5 gol = kaybetti
+              }
+              else if (predType.includes("KGV")) {
+                if (homeScore > 0 && awayScore > 0) result = "won"; // Her iki takım gol attı
+                else if (isFinished) result = "lost"; // Maç bitti ve bir takım gol atmadı
+              }
+              
+              // Eğer kazandıysa hemen güncelle, kaybetti ise sadece maç bittiyse güncelle
+              if (result === "won" || (result === "lost" && isFinished)) {
+                shouldUpdate = true;
+              }
             }
           }
+        }
+        
+        // Completed tahminlerin skorlarını güncelle (result değişmez)
+        if (pred.status === 'completed' && (pred.home_score !== homeScore || pred.away_score !== awayScore)) {
+          await pool.query(
+            "UPDATE predictions SET home_score = $1, away_score = $2, updated_at = NOW() WHERE id = $3",
+            [homeScore, awayScore, pred.id]
+          );
+          console.log(`📊 #${pred.id}: Score updated ${homeScore}-${awayScore} (already completed)`);
         }
         
         // Skorları güncelle (FT durumunda her zaman)
