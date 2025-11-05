@@ -274,9 +274,9 @@ const LEAGUE_FLAGS = {
   'holland': '🇳🇱',
   'hollanda': '🇳🇱',
   'dutch': '🇳🇱',
-  'scotland': '🇬🇧',
-  'iskocya': '🇬🇧',
-  'scottish': '🇬🇧',
+  'scotland': '🏴󠁧󠁢󠁳󠁣󠁴󠁿',
+  'iskocya': '🏴󠁧󠁢󠁳󠁣󠁴󠁿',
+  'scottish': '🏴󠁧󠁢󠁳󠁣󠁴󠁿',
   'hungary': '🇭🇺',
   'macaristan': '🇭🇺',
   'hungarian': '🇭🇺',
@@ -329,7 +329,35 @@ const LEAGUE_FLAGS = {
   'swedish': '🇸🇪',
   'chile': '🇨🇱',
   'sili': '🇨🇱',
-  'chilean': '🇨🇱'
+  'chilean': '🇨🇱',
+  'liechtenstein': '🇱🇮',
+  'kyrgyzstan': '🇰🇬',
+  'congo': '🇨🇬',
+  'dr congo': '🇨🇩',
+  'democratic republic of the congo': '🇨🇩',
+  'northern ireland': '🇬🇧',
+  'wales': '🏴󠁧󠁢󠁷󠁬󠁳󠁿',
+  'albania': '🇦🇱',
+  'arnavutluk': '🇦🇱',
+  'albanian': '🇦🇱',
+  'estonia': '🇪🇪',
+  'estonya': '🇪🇪',
+  'estonian': '🇪🇪',
+  'georgia': '🇬🇪',
+  'gürcistan': '🇬🇪',
+  'gurcistan': '🇬🇪',
+  'georgian': '🇬🇪',
+  'ivory coast': '🇨🇮',
+  "cote d'ivoire": '🇨🇮',
+  'fildisi sahilleri': '🇨🇮',
+  'luxembourg': '🇱🇺',
+  'lüksemburg': '🇱🇺',
+  'luksemburg': '🇱🇺',
+  'luxembourgish': '🇱🇺',
+  'mongolia': '🇲🇳',
+  'moğolistan': '🇲🇳',
+  'mogolistan': '🇲🇳',
+  'mongolian': '🇲🇳'
 };
 
 // Get league flag from league name
@@ -1735,6 +1763,45 @@ app.post('/api/payments/create-subscription', async (req, res) => {
     
   } catch (error) {
     console.error('Error:', error.message);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Create checkout session (hosted payment page)
+app.post('/api/payments/create-checkout-session', async (req, res) => {
+  try {
+    const { amount, currency, userId, productId, days } = req.body;
+    
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ['card'],
+      line_items: [{
+        price_data: {
+          currency: currency || 'try',
+          product_data: {
+            name: `FlashGoal VIP - ${days} gün`,
+            description: 'Premium tahmin erişimi',
+          },
+          unit_amount: amount * 100, // cents
+        },
+        quantity: 1,
+      }],
+      mode: 'payment',
+      success_url: `${process.env.FRONTEND_URL}/user/(tabs)/predictions?payment=success`,
+      cancel_url: `${process.env.FRONTEND_URL}/user/vip?payment=cancelled`,
+      metadata: {
+        userId,
+        productId,
+        days,
+      },
+    });
+    
+    res.json({
+      success: true,
+      sessionId: session.id,
+      checkoutUrl: session.url,
+    });
+  } catch (error) {
+    console.error('Stripe session error:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
