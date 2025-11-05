@@ -1475,44 +1475,203 @@ app.post('/api/auth/register', async (req, res) => {
   try {
     const { email, password, name, referralCode } = req.body;
     
-    if (!email || !password) {
-      return res.status(400).json({ success: false, error: 'Email and password required' });
+    // ========================================
+    // 1. VALIDATION: Required fields
+    // ========================================
+    if (!email || !password || !name) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Email, password, and name are required' 
+      });
     }
     
-    // Check if exists
-    const existing = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
+    // ========================================
+    // 2. VALIDATION: Email format (regex)
+    // ========================================
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Invalid email format' 
+      });
+    }
+    
+    // ========================================
+    // 3. VALIDATION: Password strength
+    // Min 8 chars, 1 uppercase, 1 number
+    // ========================================
+    if (password.length < 8) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Password must be at least 8 characters' 
+      });
+    }
+    
+    if (!/[A-Z]/.test(password)) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Password must contain at least one uppercase letter' 
+      });
+    }
+    
+    if (!/[0-9]/.test(password)) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Password must contain at least one number' 
+      });
+    }
+    
+    // ========================================
+    // 4. Normalize email to lowercase
+    // ========================================
+    const normalizedEmail = email.toLowerCase().trim();
+    
+    // ========================================
+    // 5. Check if email already exists
+    // ========================================
+    const existing = await pool.query(
+      'SELECT id FROM users WHERE email = $1', 
+      [normalizedEmail]
+    );
+    
     if (existing.rows.length > 0) {
-      return res.status(400).json({ success: false, error: 'Email already registered' });
+      return res.status(409).json({ 
+        success: false, 
+        error: 'Email already registered' 
+      });
     }
     
-    // Hash password
-    const passwordHash = await bcrypt.hash(password, 10);
+    // ========================================
+    // 6. REFERRAL CODE VALIDATION
+    // ========================================
+    let referrerUserId = null;
     
-    // Generate referral code
+    if (referralCode) {
+      const referrerQuery = await pool.query(
+        'SELECT id, referral_count FROM users WHERE referral_code = $1',
+        [referralCode.toUpperCase()]
+      );
+      
+      if (referrerQuery.rows.length === 0) {
+        return res.status(400).json({ 
+          success: false, 
+          error: 'Invalid referral code' 
+        });
+      }
+      
+      const referrer = referrerQuery.rows[0];
+      
+      // Check if referrer has reached max referrals (2)
+      if (referrer.referral_count >= 2) {
+        return res.status(400).json({ 
+          success: false, 
+          error: 'This referral code has reached its maximum usage limit' 
+        });
+      }
+      
+      referrerUserId = referrer.id;
+    }
+    
+    // ========================================
+    // 7. Hash password (bcrypt with 12 rounds)
+    // ========================================
+    const passwordHash = await bcrypt.hash(password, 12);
+    
+    // ========================================
+    // 8. Generate unique referral code for new user
+    // ========================================
     const newReferralCode = crypto.randomBytes(4).toString('hex').toUpperCase();
     
-    // Insert user
+    // ========================================
+    // 9. Insert new user
+    // ========================================
     const result = await pool.query(
       `INSERT INTO users (email, password_hash, name, referral_code, referred_by) 
        VALUES ($1, $2, $3, $4, $5) 
        RETURNING id, email, name, referral_code`,
-      [email, passwordHash, name, newReferralCode, referralCode]
+      [normalizedEmail, passwordHash, name, newReferralCode, referralCode ? referralCode.toUpperCase() : null]
     );
     
-    const user = result.rows[0];
+    const newUser = result.rows[0];
     
-    // Generate token
-    const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
+    // ========================================
+    // 10. REFERRAL REWARD SYSTEM
+    // ========================================
+    if (referrerUserId) {
+      try {
+        // A) Give referrer 24h VIP bonus
+        const vipExpiryDate = new Date();
+        vipExpiryDate.setHours(vipExpiryDate.getHours() + 24);
+        
+        await pool.query(
+          `INSERT INTO vip_access (user_id, expiry_date, product_id) 
+           VALUES ($1, $2, 'referral_bonus')
+           ON CONFLICT (user_id) 
+           DO UPDATE SET 
+             expiry_date = CASE 
+               WHEN vip_access.expiry_date > NOW() 
+               THEN vip_access.expiry_date + INTERVAL '24 hours'
+               ELSE $2
+             END,
+             updated_at = NOW()`,
+          [referrerUserId.toString(), vipExpiryDate]
+        );
+        
+        // B) Update referrer's referral count
+        await pool.query(
+          'UPDATE users SET referral_count = referral_count + 1 WHERE id = $1',
+          [referrerUserId]
+        );
+        
+        // C) Create referral record
+        await pool.query(
+          `INSERT INTO referrals (referrer_code, referrer_user_id, referred_user_id, referred_email, status, bonus_given)
+           VALUES ($1, $2, $3, $4, 'completed', true)`,
+          [referralCode.toUpperCase(), referrerUserId, newUser.id, normalizedEmail]
+        );
+        
+      } catch (referralError) {
+        // Log referral error but don't fail registration
+        // Production: Use proper logging service (e.g., Sentry, Winston)
+        if (process.env.NODE_ENV !== 'production') {
+          console.warn('Referral bonus error:', referralError.message);
+        }
+      }
+    }
     
-    res.json({ 
+    // ========================================
+    // 11. Generate JWT token
+    // ========================================
+    const token = jwt.sign(
+      { userId: newUser.id, email: newUser.email }, 
+      JWT_SECRET, 
+      { expiresIn: '30d' }
+    );
+    
+    // ========================================
+    // 12. Return success response (201 Created)
+    // ========================================
+    res.status(201).json({ 
       success: true, 
       token, 
-      userId: user.id,
-      user: { email: user.email, name: user.name }
+      userId: newUser.id,
+      user: { 
+        email: newUser.email, 
+        name: newUser.name,
+        referralCode: newUser.referral_code
+      }
     });
+    
   } catch (error) {
-    console.error('Register error:', error);
-    res.status(500).json({ success: false, error: 'Registration failed' });
+    // Production: Use proper logging service (e.g., Sentry, Winston)
+    if (process.env.NODE_ENV !== 'production') {
+      console.warn('Registration error:', error.message);
+    }
+    
+    res.status(500).json({ 
+      success: false, 
+      error: 'Registration failed. Please try again.' 
+    });
   }
 });
 
@@ -1786,8 +1945,8 @@ app.post('/api/payments/create-checkout-session', async (req, res) => {
         quantity: 1,
       }],
       mode: 'payment',
-      success_url: `${process.env.FRONTEND_URL}/user/(tabs)/predictions?payment=success`,
-      cancel_url: `${process.env.FRONTEND_URL}/user/vip?payment=cancelled`,
+      success_url: `${process.env.FRONTEND_URL || 'https://app.flashgoal.app'}/user/(tabs)/predictions?success=true`,
+      cancel_url: `${process.env.FRONTEND_URL || 'https://app.flashgoal.app'}/user/(tabs)/predictions`,
       metadata: {
         userId,
         productId,
