@@ -137,6 +137,125 @@ const rateLimitForgotPassword = (req, res, next) => {
   next();
 };
 
+// Rate limiting store for payment attempts
+const paymentAttemptStore = new Map();
+
+// Rate limiting middleware for payment endpoints (fraud prevention)
+const rateLimitPayment = (req, res, next) => {
+  const ip = req.ip || req.connection.remoteAddress;
+  const now = Date.now();
+  const windowMs = 15 * 60 * 1000; // 15 minutes
+  const maxAttempts = 3; // Max 3 payment attempts per 15 min
+  
+  const attempts = paymentAttemptStore.get(ip) || [];
+  const recentAttempts = attempts.filter(time => now - time < windowMs);
+  
+  if (recentAttempts.length >= maxAttempts) {
+    return res.status(429).json({ 
+      success: false,
+      error: 'Too many payment attempts. Please try again in 15 minutes.' 
+    });
+  }
+  
+  // Record this attempt
+  recentAttempts.push(now);
+  paymentAttemptStore.set(ip, recentAttempts);
+  
+  // Cleanup old entries periodically
+  if (Math.random() < 0.01) {
+    for (const [key, times] of paymentAttemptStore.entries()) {
+      const filtered = times.filter(time => now - time < windowMs);
+      if (filtered.length === 0) {
+        paymentAttemptStore.delete(key);
+      } else {
+        paymentAttemptStore.set(key, filtered);
+      }
+    }
+  }
+  
+  next();
+};
+
+// JWT Authentication Middleware
+const authenticateToken = async (req, res, next) => {
+  try {
+    // 1. Extract & validate authorization header
+    const authHeader = req.headers.authorization;
+    
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ 
+        success: false,
+        error: 'Authentication required' 
+      });
+    }
+    
+    // 2. Extract & trim token
+    const token = authHeader.replace('Bearer ', '').trim();
+    
+    if (!token) {
+      return res.status(401).json({ 
+        success: false,
+        error: 'No token provided' 
+      });
+    }
+    
+    // 3. Verify JWT token
+    const decoded = jwt.verify(token, JWT_SECRET);
+    
+    // 4. Validate token payload structure
+    if (!decoded.userId) {
+      return res.status(401).json({ 
+        success: false,
+        error: 'Invalid token payload' 
+      });
+    }
+    
+    // 5. Check if user still exists
+    const userResult = await pool.query(
+      'SELECT id, email, name FROM users WHERE id = $1',
+      [decoded.userId]
+    );
+    
+    if (userResult.rows.length === 0) {
+      return res.status(401).json({ 
+        success: false,
+        error: 'User not found' 
+      });
+    }
+    
+    // 6. Attach user to request object
+    req.user = {
+      id: userResult.rows[0].id,
+      email: userResult.rows[0].email,
+      name: userResult.rows[0].name
+    };
+    
+    next();
+    
+  } catch (error) {
+    // Production-safe error handling
+    if (error.name === 'TokenExpiredError') {
+      return res.status(401).json({ 
+        success: false,
+        error: 'Token expired' 
+      });
+    }
+    
+    if (error.name === 'JsonWebTokenError') {
+      return res.status(401).json({ 
+        success: false,
+        error: 'Invalid token' 
+      });
+    }
+    
+    // Generic authentication error
+    return res.status(401).json({ 
+      success: false,
+      error: 'Authentication failed' 
+    });
+  }
+};
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
@@ -612,6 +731,30 @@ async function initDatabase() {
     
     await pool.query('DROP TABLE IF EXISTS pending_predictions CASCADE');
     console.log('🗑️ Cleaned');
+    
+    // ==========================================
+    // PAYMENT ATTEMPTS TABLE - Security & Audit Trail
+    // ==========================================
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS payment_attempts (
+        id SERIAL PRIMARY KEY,
+        user_id INT NOT NULL,
+        product_id VARCHAR(50) NOT NULL,
+        amount INT NOT NULL,
+        currency VARCHAR(3) DEFAULT 'try',
+        stripe_session_id VARCHAR(255) UNIQUE,
+        status VARCHAR(20) DEFAULT 'initiated',
+        ip_address VARCHAR(45),
+        user_agent TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_payment_user ON payment_attempts(user_id)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_payment_session ON payment_attempts(stripe_session_id)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_payment_status ON payment_attempts(status)`);
+    console.log('✅ Payment attempts table ready');
     
   } catch (error) {
     console.error('❌ DB error:', error);
@@ -2305,44 +2448,180 @@ app.post('/api/payments/create-subscription', async (req, res) => {
   }
 });
 
-// Create checkout session (hosted payment page)
-app.post('/api/payments/create-checkout-session', async (req, res) => {
-  try {
-    const { amount, currency, userId, productId, days } = req.body;
-    
-    const session = await stripe.checkout.sessions.create({
-      payment_method_types: ['card'],
-      line_items: [{
-        price_data: {
-          currency: currency || 'try',
-          product_data: {
-            name: `FlashGoal VIP - ${days} gün`,
-            description: 'Premium tahmin erişimi',
-          },
-          unit_amount: amount * 100, // cents
-        },
-        quantity: 1,
-      }],
-      mode: 'payment',
-      success_url: `${process.env.FRONTEND_URL || 'https://app.flashgoal.app'}/user/(tabs)/predictions?success=true`,
-      cancel_url: `${process.env.FRONTEND_URL || 'https://app.flashgoal.app'}/user/(tabs)/predictions`,
-      metadata: {
-        userId,
-        productId,
-        days,
-      },
-    });
-    
-    res.json({
-      success: true,
-      sessionId: session.id,
-      checkoutUrl: session.url,
-    });
-  } catch (error) {
-    console.error('Stripe session error:', error);
-    res.status(500).json({ success: false, error: error.message });
+// ==========================================
+// SERVER-SIDE PRICING TABLE (CRITICAL SECURITY)
+// ==========================================
+// Client CANNOT control prices - server determines amount based on productId
+const PRODUCTS = {
+  'vip-daily': { 
+    amount: 9900,      // 99 TRY in cents
+    days: 1,
+    name: 'FlashGoal VIP - 1 Gün',
+    description: '24 saat premium tahmin erişimi'
+  },
+  'vip-weekly': { 
+    amount: 39900,     // 399 TRY in cents
+    days: 7,
+    name: 'FlashGoal VIP - 1 Hafta',
+    description: '7 gün premium tahmin erişimi'
+  },
+  'vip-monthly': { 
+    amount: 99900,     // 999 TRY in cents
+    days: 30,
+    name: 'FlashGoal VIP - 1 Ay',
+    description: '30 gün premium tahmin erişimi'
+  },
+  'vip-quarterly': { 
+    amount: 199900,    // 1999 TRY in cents
+    days: 90,
+    name: 'FlashGoal VIP - 3 Ay',
+    description: '90 gün premium tahmin erişimi'
   }
-});
+};
+
+// ==========================================
+// POST /api/payments/create-checkout-session
+// SECURE PAYMENT ENDPOINT (JWT + Rate Limit + Server-side Pricing)
+// ==========================================
+app.post('/api/payments/create-checkout-session', 
+  authenticateToken,      // 1️⃣ JWT Authentication (req.user extracted from token)
+  rateLimitPayment,       // 2️⃣ Rate limiting (3 attempts per 15 min)
+  async (req, res) => {
+    const ip = req.ip || req.connection.remoteAddress;
+    
+    try {
+      // ========================================
+      // 3️⃣ INPUT VALIDATION
+      // ========================================
+      const { productId } = req.body;
+      
+      // Validate productId required
+      if (!productId) {
+        return res.status(400).json({ 
+          success: false, 
+          error: 'Product ID is required' 
+        });
+      }
+      
+      // Validate productId exists in server pricing table
+      const product = PRODUCTS[productId];
+      if (!product) {
+        return res.status(400).json({ 
+          success: false, 
+          error: 'Invalid product ID' 
+        });
+      }
+      
+      // ========================================
+      // 4️⃣ SERVER-SIDE PRICING (CRITICAL!)
+      // Use server-defined prices - NEVER trust client
+      // ========================================
+      const { amount, days, name, description } = product;
+      const userId = req.user.id; // From JWT token (NOT from client!)
+      const userEmail = req.user.email; // From JWT token
+      
+      // ========================================
+      // 5️⃣ CREATE STRIPE CHECKOUT SESSION
+      // ========================================
+      const session = await stripe.checkout.sessions.create({
+        payment_method_types: ['card'],
+        line_items: [{
+          price_data: {
+            currency: 'try',
+            product_data: {
+              name: name,
+              description: description,
+            },
+            unit_amount: amount, // Server-controlled amount (in cents)
+          },
+          quantity: 1,
+        }],
+        mode: 'payment',
+        success_url: `${process.env.FRONTEND_URL || 'https://app.flashgoal.app'}/user/(tabs)/predictions?success=true`,
+        cancel_url: `${process.env.FRONTEND_URL || 'https://app.flashgoal.app'}/user/(tabs)/predictions`,
+        customer_email: userEmail,
+        metadata: {
+          userId: userId.toString(),
+          productId: productId,
+          days: days.toString(),
+          amount: amount.toString()
+        },
+      });
+      
+      // ========================================
+      // 6️⃣ DATABASE LOGGING (Audit Trail)
+      // ========================================
+      await pool.query(
+        `INSERT INTO payment_attempts 
+         (user_id, product_id, amount, currency, stripe_session_id, status, ip_address, user_agent)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [
+          userId,
+          productId,
+          amount,
+          'try',
+          session.id,
+          'initiated',
+          ip,
+          req.headers['user-agent'] || 'unknown'
+        ]
+      );
+      
+      // ========================================
+      // 7️⃣ SUCCESS RESPONSE
+      // ========================================
+      res.json({
+        success: true,
+        sessionId: session.id,
+        checkoutUrl: session.url,
+        product: {
+          id: productId,
+          name: name,
+          amount: amount / 100, // Convert cents to TRY for display
+          days: days
+        }
+      });
+      
+    } catch (error) {
+      // ========================================
+      // 8️⃣ PRODUCTION-SAFE ERROR HANDLING
+      // ========================================
+      
+      // Log error in development only (NEVER expose to client)
+      if (process.env.NODE_ENV !== 'production') {
+        console.error('Payment session error:', error);
+      }
+      
+      // Log failed attempt to database
+      try {
+        await pool.query(
+          `INSERT INTO payment_attempts 
+           (user_id, product_id, amount, status, ip_address, user_agent)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [
+            req.user?.id || null,
+            req.body.productId || 'unknown',
+            0,
+            'failed',
+            ip,
+            req.headers['user-agent'] || 'unknown'
+          ]
+        );
+      } catch (logError) {
+        // Silent fail for logging errors
+        if (process.env.NODE_ENV !== 'production') {
+          console.error('Failed to log error:', logError);
+        }
+      }
+      
+      // Generic user-friendly error (NO sensitive data)
+      res.status(500).json({ 
+        success: false, 
+        error: 'Payment session creation failed. Please try again later.' 
+      });
+    }
+  }
+);
 
 // Verify payment and activate VIP
 app.post('/api/payments/verify', async (req, res) => {
