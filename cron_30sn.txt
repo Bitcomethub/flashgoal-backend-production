@@ -1,0 +1,181 @@
+cron.schedule("*/30 * * * * *", async () => {
+  try {
+    const { rows } = await pool.query("SELECT * FROM predictions WHERE status = 'active'");
+    
+    for (const pred of rows) {
+      try {
+        const response = await axios.get(
+          `https://v3.football.api-sports.io/fixtures?id=${pred.match_id}`, 
+          { 
+            headers: { "x-apisports-key": process.env.FOOTBALL_API_KEY },
+            timeout: 5000
+          }
+        );
+        
+        const fixture = response.data.response[0];
+        if (!fixture) continue;
+        
+        const statusShort = fixture.fixture.status.short;
+        const predType = pred.prediction_type.toUpperCase();
+        const homeGoals = fixture.goals.home ?? null;
+        const awayGoals = fixture.goals.away ?? null;
+        
+        // Handle null scores
+        const homeScore = homeGoals !== null ? homeGoals : 0;
+        const awayScore = awayGoals !== null ? awayGoals : 0;
+        const total = homeScore + awayScore;
+        
+        const htScore = fixture.score?.halftime;
+        const htTotal = htScore ? (htScore.home || 0) + (htScore.away || 0) : 0;
+        
+        const isFinished = ["FT", "AET", "PEN"].includes(statusShort);
+        const isHT = ["HT", "2H", "FT", "AET", "PEN"].includes(statusShort);
+        
+        let result = null;
+        let shouldUpdate = false;
+        let shouldUpdateScore = false;
+        
+        // FT durumunda skorları her zaman güncelle
+        if (isFinished) {
+          shouldUpdateScore = true;
+        }
+        
+        // İY (İlk Yarı) tahminleri - HT'de kontrol et
+        if (predType.includes("İY") || predType.includes("IY")) {
+          if (isHT) {
+            if (predType.includes("0.5Ü")) result = htTotal > 0.5 ? "won" : "lost";
+            else if (predType.includes("1.5Ü")) result = htTotal > 1.5 ? "won" : "lost";
+            else if (predType.includes("2.5Ü")) result = htTotal > 2.5 ? "won" : "lost";
+            shouldUpdate = true;
+          }
+        } 
+        // MB (Maç Boyu) tahminleri - Canlı maçta erken kazanma kontrolü
+        else if (predType.includes("MB")) {
+          const isLive = ["1H", "2H", "HT", "FT", "AET", "PEN"].includes(statusShort);
+          
+          if (isLive) {
+            // MB tahminleri için erken kazanma kontrolü
+            if (predType.includes("0.5Ü")) {
+              if (total >= 1) result = "won"; // 0.5Ü için 1+ gol = kazandı
+              else if (isFinished) result = "lost"; // Maç bitti ve 0 gol = kaybetti
+            }
+            else if (predType.includes("1.5Ü")) {
+              if (total >= 2) result = "won"; // 1.5Ü için 2+ gol = kazandı
+              else if (isFinished) result = "lost"; // Maç bitti ve <2 gol = kaybetti
+            }
+            else if (predType.includes("2.5Ü")) {
+              if (total >= 3) result = "won"; // 2.5Ü için 3+ gol = kazandı
+              else if (isFinished) result = "lost"; // Maç bitti ve <3 gol = kaybetti
+            }
+            else if (predType.includes("3.5Ü")) {
+              if (total >= 4) result = "won"; // 3.5Ü için 4+ gol = kazandı
+              else if (isFinished) result = "lost"; // Maç bitti ve <4 gol = kaybetti
+            }
+            else if (predType.includes("4.5Ü")) {
+              if (total >= 5) result = "won"; // 4.5Ü için 5+ gol = kazandı
+              else if (isFinished) result = "lost"; // Maç bitti ve <5 gol = kaybetti
+            }
+            else if (predType.includes("KGV")) {
+              if (homeScore > 0 && awayScore > 0) result = "won"; // Her iki takım gol attı
+              else if (isFinished) result = "lost"; // Maç bitti ve bir takım gol atmadı
+            }
+            
+            // Eğer kazandıysa hemen güncelle, kaybetti ise sadece maç bittiyse güncelle
+            if (result === "won" || (result === "lost" && isFinished)) {
+              shouldUpdate = true;
+            }
+          }
+        }
+        
+        // Skorları güncelle (FT durumunda her zaman)
+        if (shouldUpdateScore) {
+          await pool.query(
+            "UPDATE predictions SET home_score = $1, away_score = $2, updated_at = NOW() WHERE id = $3",
+            [homeScore, awayScore, pred.id]
+          );
+        }
+        
+        // Status ve result güncelle
+        if (shouldUpdate && result) {
+          await pool.query(
+            "UPDATE predictions SET status = 'completed', result = $1, completed_at = NOW(), home_score = $2, away_score = $3, updated_at = NOW() WHERE id = $4",
+            [result, homeScore, awayScore, pred.id]
+          );
+          const liveStatus = ["1H", "2H", "HT"].includes(statusShort) ? " (LIVE)" : "";
+          console.log(`✅ #${pred.id}: ${result.toUpperCase()}${liveStatus} - ${homeScore}-${awayScore}`);
+        }
+        // FT durumunda result belirlenemediyse sadece status'u güncelle
+        else if (isFinished && shouldUpdateScore) {
+          await pool.query(
+            "UPDATE predictions SET status = 'completed', completed_at = NOW(), home_score = $1, away_score = $2, updated_at = NOW() WHERE id = $3",
+            [homeScore, awayScore, pred.id]
+          );
+          console.log(`✅ #${pred.id}: Completed (FT) - ${homeScore}-${awayScore}`);
+        }
+      } catch (err) {
+        console.error(`❌ Check #${pred.id}:`, err.message);
+      }
+    }
+  } catch (error) {
+    console.error("❌ Cron:", error.message);
+  }
+});
+
+
+// ==========================================
+// REFERRAL SYSTEM - Helper Functions
+// ==========================================
+
+// Generate unique referral code (6 characters: uppercase + number)
+async function generateReferralCode() {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+  const numbers = '0123456789';
+  let code;
+  let exists = true;
+  
+  while (exists) {
+    // Generate 4 uppercase letters + 2 numbers
+    const letters = Array.from({ length: 4 }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
+    const nums = Array.from({ length: 2 }, () => numbers[Math.floor(Math.random() * numbers.length)]).join('');
+    code = letters + nums;
+    
+    // Check if code already exists
+    const result = await pool.query('SELECT id FROM users WHERE referral_code = $1', [code]);
+    exists = result.rows.length > 0;
+  }
+  
+  return code;
+}
+
+// Add VIP days to user (extend existing or create new)
+async function addVIPDays(userId, days) {
+  try {
+    // Check if user has existing VIP
+    const existing = await pool.query(
+      'SELECT expiry_date FROM vip_access WHERE user_id = $1',
+      [userId]
+    );
+    
+    let expiryDate;
+    if (existing.rows.length > 0 && existing.rows[0].expiry_date) {
+      // Extend existing VIP
+      const currentExpiry = new Date(existing.rows[0].expiry_date);
+      expiryDate = new Date(currentExpiry);
+      expiryDate.setDate(expiryDate.getDate() + days);
+    } else {
+      // Create new VIP
+      expiryDate = new Date();
+      expiryDate.setDate(expiryDate.getDate() + days);
+    }
+    
+    await pool.query(
+      `INSERT INTO vip_access (user_id, expiry_date, product_id) 
+       VALUES ($1, $2, $3)
+       ON CONFLICT (user_id) 
+       DO UPDATE SET expiry_date = $2, updated_at = NOW()`,
+      [userId, expiryDate, 'referral_bonus']
+    );
+    
+    return expiryDate;
+  } catch (error) {
+    console.error('Error adding VIP days:', error);

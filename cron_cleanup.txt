@@ -1,0 +1,13 @@
+cron.schedule("0 3 * * *", async () => {
+  try {
+    const result = await pool.query(
+      `DELETE FROM predictions 
+       WHERE created_at < NOW() - INTERVAL '2 days' 
+       RETURNING id`
+    );
+    console.log(`🗑️ Auto cleanup: Deleted ${result.rowCount} old predictions`);
+  } catch (error) {
+    console.error("❌ Auto cleanup error:", error.message);
+  }
+});
+
