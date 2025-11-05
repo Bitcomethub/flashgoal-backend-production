@@ -2184,31 +2184,47 @@ app.post('/api/auth/reset-password', async (req, res) => {
   }
 });
 
-// GET /api/user/vip-status
-app.get('/api/user/vip-status', async (req, res) => {
-  try {
-    const token = req.headers.authorization?.replace('Bearer ', '');
-    const decoded = jwt.verify(token, JWT_SECRET);
-    
-    const result = await pool.query(
-      'SELECT * FROM vip_access WHERE user_id = $1 AND expiry_date > NOW()',
-      [decoded.userId.toString()]
-    );
-    
-    if (result.rows.length > 0) {
-      const vip = result.rows[0];
-      res.json({
-        isVIP: true,
-        expiresAt: vip.expiry_date,
-        subscriptionType: vip.product_id
-      });
-    } else {
-      res.json({ isVIP: false });
-    }
-  } catch (error) {
-    res.status(401).json({ isVIP: false });
-  }
-});
+// ==========================================
+// DEPRECATED: GET /api/user/vip-status
+// ==========================================
+// This endpoint has been REMOVED (deprecated as of November 5, 2025)
+// 
+// REASON:
+// - Duplicate functionality with /api/auth/validate
+// - /api/auth/validate already returns complete VIP status (isVIP, vipExpiresAt)
+// - Maintenance burden (two endpoints doing the same thing)
+// - Inconsistent response format compared to other auth endpoints
+//
+// MIGRATION:
+// Frontend should use GET /api/auth/validate instead
+// Response includes: { valid, userId, isVIP, vipExpiresAt, user: { email, name } }
+//
+// REMOVED CODE (for reference):
+// app.get('/api/user/vip-status', async (req, res) => {
+//   try {
+//     const token = req.headers.authorization?.replace('Bearer ', '');
+//     const decoded = jwt.verify(token, JWT_SECRET);
+//     
+//     const result = await pool.query(
+//       'SELECT * FROM vip_access WHERE user_id = $1 AND expiry_date > NOW()',
+//       [decoded.userId.toString()]
+//     );
+//     
+//     if (result.rows.length > 0) {
+//       const vip = result.rows[0];
+//       res.json({
+//         isVIP: true,
+//         expiresAt: vip.expiry_date,
+//         subscriptionType: vip.product_id
+//       });
+//     } else {
+//       res.json({ isVIP: false });
+//     }
+//   } catch (error) {
+//     res.status(401).json({ isVIP: false });
+//   }
+// });
+// ==========================================
 
 app.listen(PORT, () => {
   console.log(`🚀 FlashGoal API v5.1 - Port ${PORT}`);
