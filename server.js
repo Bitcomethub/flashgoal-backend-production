@@ -1837,24 +1837,117 @@ app.post('/api/auth/login', rateLimitLogin, async (req, res) => {
 // GET /api/auth/validate
 app.get('/api/auth/validate', async (req, res) => {
   try {
-    const token = req.headers.authorization?.replace('Bearer ', '');
+    // ========================================
+    // 1. Extract & validate authorization header
+    // ========================================
+    const authHeader = req.headers.authorization;
+    
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ 
+        valid: false, 
+        error: 'Invalid authorization header format' 
+      });
+    }
+    
+    // ========================================
+    // 2. Extract & trim token
+    // ========================================
+    const token = authHeader.replace('Bearer ', '').trim();
     
     if (!token) {
-      return res.json({ valid: false });
+      return res.status(401).json({ 
+        valid: false, 
+        error: 'No token provided' 
+      });
     }
     
+    // ========================================
+    // 3. Verify JWT token
+    // ========================================
     const decoded = jwt.verify(token, JWT_SECRET);
     
-    // Check if user still exists
-    const result = await pool.query('SELECT id FROM users WHERE id = $1', [decoded.userId]);
-    
-    if (result.rows.length === 0) {
-      return res.json({ valid: false });
+    // ========================================
+    // 4. Validate token payload structure
+    // ========================================
+    if (!decoded.userId) {
+      return res.status(401).json({ 
+        valid: false, 
+        error: 'Invalid token payload' 
+      });
     }
     
-    res.json({ valid: true, userId: decoded.userId });
+    // ========================================
+    // 5. Check if user still exists + get user data
+    // ========================================
+    const userResult = await pool.query(
+      'SELECT id, email, name FROM users WHERE id = $1',
+      [decoded.userId]
+    );
+    
+    if (userResult.rows.length === 0) {
+      return res.status(401).json({ 
+        valid: false, 
+        error: 'User not found' 
+      });
+    }
+    
+    const user = userResult.rows[0];
+    
+    // ========================================
+    // 6. Check VIP status
+    // ========================================
+    const vipResult = await pool.query(
+      'SELECT expiry_date, product_id FROM vip_access WHERE user_id = $1 AND expiry_date > NOW()',
+      [user.id.toString()]
+    );
+    
+    const isVIP = vipResult.rows.length > 0;
+    const vipExpiresAt = isVIP ? vipResult.rows[0].expiry_date : null;
+    
+    // ========================================
+    // 7. Return success response (200 OK)
+    // ========================================
+    res.json({ 
+      valid: true, 
+      userId: user.id,
+      isVIP,
+      vipExpiresAt,
+      user: {
+        email: user.email,
+        name: user.name
+      }
+    });
+    
   } catch (error) {
-    res.json({ valid: false });
+    // ========================================
+    // 8. Production-safe error handling
+    // ========================================
+    
+    // Log in development only
+    if (process.env.NODE_ENV !== 'production') {
+      console.error('Token validation error:', error.message);
+    }
+    
+    // Specific error handling for JWT errors
+    if (error.name === 'TokenExpiredError') {
+      return res.status(401).json({ 
+        valid: false, 
+        error: 'Token expired' 
+      });
+    }
+    
+    if (error.name === 'JsonWebTokenError') {
+      return res.status(401).json({ 
+        valid: false, 
+        error: 'Invalid token' 
+      });
+    }
+    
+    // Generic server error
+    res.status(500).json({ 
+      valid: false, 
+      error: 'Token validation failed' 
+    });
   }
 });
 
