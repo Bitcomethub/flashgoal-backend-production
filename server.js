@@ -32,6 +32,7 @@ app.use('/static', express.static(path.join(__dirname, 'public')));
 
 // Rate limiting için basit memory store
 const rateLimitStore = new Map();
+const loginAttemptStore = new Map();
 
 // Rate limiting middleware (batch endpoint için)
 const rateLimitBatch = (req, res, next) => {
@@ -60,6 +61,38 @@ const rateLimitBatch = (req, res, next) => {
         rateLimitStore.delete(key);
       } else {
         rateLimitStore.set(key, filtered);
+      }
+    }
+  }
+  
+  next();
+};
+
+// Rate limiting middleware for login (brute force protection)
+const rateLimitLogin = (req, res, next) => {
+  const ip = req.ip || req.connection.remoteAddress;
+  const now = Date.now();
+  const windowMs = 15 * 60 * 1000; // 15 minutes
+  const maxAttempts = 5;
+  
+  const attempts = loginAttemptStore.get(ip) || [];
+  const recentAttempts = attempts.filter(time => now - time < windowMs);
+  
+  if (recentAttempts.length >= maxAttempts) {
+    return res.status(429).json({ 
+      success: false,
+      error: 'Too many login attempts. Please try again in 15 minutes.' 
+    });
+  }
+  
+  // Cleanup old entries periodically
+  if (Math.random() < 0.01) {
+    for (const [key, times] of loginAttemptStore.entries()) {
+      const filtered = times.filter(time => now - time < windowMs);
+      if (filtered.length === 0) {
+        loginAttemptStore.delete(key);
+      } else {
+        loginAttemptStore.set(key, filtered);
       }
     }
   }
@@ -1676,49 +1709,128 @@ app.post('/api/auth/register', async (req, res) => {
 });
 
 // POST /api/auth/login
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', rateLimitLogin, async (req, res) => {
+  const ip = req.ip || req.connection.remoteAddress;
+  
   try {
     const { email, password } = req.body;
     
-    // Get user
-    const result = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+    // ========================================
+    // 1. VALIDATION: Required fields
+    // ========================================
+    if (!email || !password) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Email and password are required' 
+      });
+    }
     
+    // ========================================
+    // 2. VALIDATION: Email format (regex)
+    // ========================================
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Invalid email format' 
+      });
+    }
+    
+    // ========================================
+    // 3. Normalize email to lowercase (match register behavior)
+    // ========================================
+    const normalizedEmail = email.toLowerCase().trim();
+    
+    // ========================================
+    // 4. Get user (SELECT specific columns only)
+    // ========================================
+    const result = await pool.query(
+      'SELECT id, email, password_hash, name FROM users WHERE email = $1', 
+      [normalizedEmail]
+    );
+    
+    // Track failed login attempt
     if (result.rows.length === 0) {
-      return res.status(401).json({ success: false, error: 'Invalid credentials' });
+      // Record failed attempt for rate limiting
+      const attempts = loginAttemptStore.get(ip) || [];
+      attempts.push(Date.now());
+      loginAttemptStore.set(ip, attempts);
+      
+      return res.status(401).json({ 
+        success: false, 
+        error: 'Invalid credentials' 
+      });
     }
     
     const user = result.rows[0];
     
-    // Check password
+    // ========================================
+    // 5. Check password (bcrypt)
+    // ========================================
     const valid = await bcrypt.compare(password, user.password_hash);
     
     if (!valid) {
-      return res.status(401).json({ success: false, error: 'Invalid credentials' });
+      // Record failed attempt for rate limiting
+      const attempts = loginAttemptStore.get(ip) || [];
+      attempts.push(Date.now());
+      loginAttemptStore.set(ip, attempts);
+      
+      return res.status(401).json({ 
+        success: false, 
+        error: 'Invalid credentials' 
+      });
     }
     
-    // Check VIP status
+    // ========================================
+    // 6. Check VIP status
+    // ========================================
     const vipCheck = await pool.query(
-      'SELECT * FROM vip_access WHERE user_id = $1 AND expiry_date > NOW()',
+      'SELECT expiry_date, product_id FROM vip_access WHERE user_id = $1 AND expiry_date > NOW()',
       [user.id.toString()]
     );
     
     const isVIP = vipCheck.rows.length > 0;
     const vipExpiresAt = isVIP ? vipCheck.rows[0].expiry_date : null;
     
-    // Generate token
-    const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
+    // ========================================
+    // 7. Generate JWT token
+    // ========================================
+    const token = jwt.sign(
+      { userId: user.id, email: user.email }, 
+      JWT_SECRET, 
+      { expiresIn: '30d' }
+    );
     
+    // ========================================
+    // 8. Clear failed login attempts on success
+    // ========================================
+    loginAttemptStore.delete(ip);
+    
+    // ========================================
+    // 9. Return success response
+    // ========================================
     res.json({ 
       success: true, 
       token, 
       userId: user.id,
       isVIP,
       vipExpiresAt,
-      user: { email: user.email, name: user.name }
+      user: { 
+        email: user.email, 
+        name: user.name 
+      }
     });
+    
   } catch (error) {
-    console.error('Login error:', error);
-    res.status(500).json({ success: false, error: 'Login failed' });
+    // Production-safe error logging (no sensitive data)
+    if (process.env.NODE_ENV !== 'production') {
+      console.error('Login error:', error.message);
+    }
+    
+    res.status(500).json({ 
+      success: false, 
+      error: 'Login failed. Please try again.' 
+    });
   }
 });
 
