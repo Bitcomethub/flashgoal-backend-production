@@ -33,6 +33,7 @@ app.use('/static', express.static(path.join(__dirname, 'public')));
 // Rate limiting için basit memory store
 const rateLimitStore = new Map();
 const loginAttemptStore = new Map();
+const forgotPasswordAttemptStore = new Map();
 
 // Rate limiting middleware (batch endpoint için)
 const rateLimitBatch = (req, res, next) => {
@@ -93,6 +94,42 @@ const rateLimitLogin = (req, res, next) => {
         loginAttemptStore.delete(key);
       } else {
         loginAttemptStore.set(key, filtered);
+      }
+    }
+  }
+  
+  next();
+};
+
+// Rate limiting middleware for forgot-password (email bombing prevention)
+const rateLimitForgotPassword = (req, res, next) => {
+  const ip = req.ip || req.connection.remoteAddress;
+  const now = Date.now();
+  const windowMs = 15 * 60 * 1000; // 15 minutes
+  const maxAttempts = 3; // Max 3 password reset requests per 15 min
+  
+  const attempts = forgotPasswordAttemptStore.get(ip) || [];
+  const recentAttempts = attempts.filter(time => now - time < windowMs);
+  
+  if (recentAttempts.length >= maxAttempts) {
+    return res.status(429).json({ 
+      success: false,
+      error: 'Too many password reset attempts. Please try again in 15 minutes.' 
+    });
+  }
+  
+  // Record this attempt
+  recentAttempts.push(now);
+  forgotPasswordAttemptStore.set(ip, recentAttempts);
+  
+  // Cleanup old entries periodically
+  if (Math.random() < 0.01) {
+    for (const [key, times] of forgotPasswordAttemptStore.entries()) {
+      const filtered = times.filter(time => now - time < windowMs);
+      if (filtered.length === 0) {
+        forgotPasswordAttemptStore.delete(key);
+      } else {
+        forgotPasswordAttemptStore.set(key, filtered);
       }
     }
   }
@@ -1952,46 +1989,106 @@ app.get('/api/auth/validate', async (req, res) => {
 });
 
 // POST /api/auth/forgot-password
-app.post('/api/auth/forgot-password', async (req, res) => {
+app.post('/api/auth/forgot-password', rateLimitForgotPassword, async (req, res) => {
   try {
     const { email } = req.body;
     
-    const result = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+    // ========================================
+    // 1. VALIDATION: Email required
+    // ========================================
+    if (!email) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Email is required' 
+      });
+    }
+    
+    // ========================================
+    // 2. VALIDATION: Email format (regex)
+    // ========================================
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Invalid email format' 
+      });
+    }
+    
+    // ========================================
+    // 3. Normalize email to lowercase (match login/register)
+    // ========================================
+    const normalizedEmail = email.toLowerCase().trim();
+    
+    // ========================================
+    // 4. Get user (SELECT specific columns only)
+    // ========================================
+    const result = await pool.query(
+      'SELECT id, email FROM users WHERE email = $1',
+      [normalizedEmail]
+    );
     
     if (result.rows.length === 0) {
-      // Don't reveal if email exists
+      // Don't reveal if email exists (security)
       return res.json({ success: true });
     }
     
     const user = result.rows[0];
     
-    // Generate reset token
-    const resetToken = crypto.randomBytes(32).toString('hex');
+    // ========================================
+    // 5. Generate reset token (plain) & hash it
+    // ========================================
+    const resetToken = crypto.randomBytes(32).toString('hex'); // Plain token for email
+    const tokenHash = crypto.createHash('sha256').update(resetToken).digest('hex'); // Hash for DB
     const resetExpires = Date.now() + 15 * 60 * 1000; // 15 minutes
     
+    // ========================================
+    // 6. Store HASHED token in database (CRITICAL SECURITY)
+    // ========================================
     await pool.query(
       'UPDATE users SET reset_token = $1, reset_token_expires = $2 WHERE id = $3',
-      [resetToken, resetExpires, user.id]
+      [tokenHash, resetExpires, user.id]
     );
     
-    // Send email
-    const resetLink = `flashgoal://reset-password?token=${resetToken}`;
+    // ========================================
+    // 7. Send email with PLAIN token
+    // ========================================
+    try {
+      const resetLink = `flashgoal://reset-password?token=${resetToken}`;
+      
+      await emailTransporter.sendMail({
+        to: normalizedEmail,
+        subject: 'FlashGoal - Şifre Sıfırlama',
+        html: `
+          <h2>Şifre Sıfırlama</h2>
+          <p>Şifrenizi sıfırlamak için aşağıdaki linke tıklayın:</p>
+          <a href="${resetLink}">Şifremi Sıfırla</a>
+          <p>Bu link 15 dakika geçerlidir.</p>
+          <p style="color: #999; font-size: 12px;">Eğer bu isteği siz yapmadıysanız, bu e-postayı görmezden gelebilirsiniz.</p>
+        `
+      });
+    } catch (emailError) {
+      // Log email error but don't reveal to user (security)
+      if (process.env.NODE_ENV !== 'production') {
+        console.error('Email send error:', emailError.message);
+      }
+      // Still return success to prevent email enumeration
+    }
     
-    await emailTransporter.sendMail({
-      to: email,
-      subject: 'FlashGoal - Şifre Sıfırlama',
-      html: `
-        <h2>Şifre Sıfırlama</h2>
-        <p>Şifrenizi sıfırlamak için aşağıdaki linke tıklayın:</p>
-        <a href="${resetLink}">Şifremi Sıfırla</a>
-        <p>Bu link 15 dakika geçerlidir.</p>
-      `
-    });
-    
+    // ========================================
+    // 8. Always return success (security)
+    // ========================================
     res.json({ success: true });
+    
   } catch (error) {
-    console.error('Forgot password error:', error);
-    res.status(500).json({ success: false, error: 'Failed to send reset email' });
+    // Production-safe error logging (no sensitive data)
+    if (process.env.NODE_ENV !== 'production') {
+      console.error('Forgot password error:', error.message);
+    }
+    
+    res.status(500).json({ 
+      success: false, 
+      error: 'Failed to process request. Please try again.' 
+    });
   }
 });
 
@@ -2000,29 +2097,90 @@ app.post('/api/auth/reset-password', async (req, res) => {
   try {
     const { token, newPassword } = req.body;
     
+    // ========================================
+    // 1. VALIDATION: Required fields
+    // ========================================
+    if (!token || !newPassword) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Token and new password are required' 
+      });
+    }
+    
+    // ========================================
+    // 2. VALIDATION: Password strength
+    // ========================================
+    if (newPassword.length < 8) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Password must be at least 8 characters' 
+      });
+    }
+    
+    if (!/[A-Z]/.test(newPassword)) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Password must contain at least one uppercase letter' 
+      });
+    }
+    
+    if (!/[0-9]/.test(newPassword)) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Password must contain at least one number' 
+      });
+    }
+    
+    // ========================================
+    // 3. Hash the token for database lookup
+    // ========================================
+    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+    
+    // ========================================
+    // 4. Find user with valid token (SELECT specific columns)
+    // ========================================
     const result = await pool.query(
-      'SELECT * FROM users WHERE reset_token = $1 AND reset_token_expires > $2',
-      [token, Date.now()]
+      'SELECT id, email FROM users WHERE reset_token = $1 AND reset_token_expires > $2',
+      [tokenHash, Date.now()]
     );
     
     if (result.rows.length === 0) {
-      return res.status(400).json({ success: false, error: 'Invalid or expired token' });
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Invalid or expired token' 
+      });
     }
     
     const user = result.rows[0];
     
-    // Hash new password
-    const passwordHash = await bcrypt.hash(newPassword, 10);
+    // ========================================
+    // 5. Hash new password (bcrypt with 12 rounds)
+    // ========================================
+    const passwordHash = await bcrypt.hash(newPassword, 12);
     
+    // ========================================
+    // 6. Update password and clear reset token
+    // ========================================
     await pool.query(
       'UPDATE users SET password_hash = $1, reset_token = NULL, reset_token_expires = NULL WHERE id = $2',
       [passwordHash, user.id]
     );
     
+    // ========================================
+    // 7. Return success response
+    // ========================================
     res.json({ success: true });
+    
   } catch (error) {
-    console.error('Reset password error:', error);
-    res.status(500).json({ success: false, error: 'Failed to reset password' });
+    // Production-safe error logging (no sensitive data)
+    if (process.env.NODE_ENV !== 'production') {
+      console.error('Reset password error:', error.message);
+    }
+    
+    res.status(500).json({ 
+      success: false, 
+      error: 'Failed to reset password. Please try again.' 
+    });
   }
 });
 
