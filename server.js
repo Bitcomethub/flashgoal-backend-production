@@ -256,6 +256,160 @@ const authenticateToken = async (req, res, next) => {
   }
 };
 
+// ==========================================
+// ADMIN AUTHENTICATION MIDDLEWARE
+// ==========================================
+
+// Admin list (in production, move to database)
+const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || 'admin@flashgoal.app').split(',').map(e => e.trim().toLowerCase());
+const SUPER_ADMIN_EMAILS = (process.env.SUPER_ADMIN_EMAILS || 'superadmin@flashgoal.app').split(',').map(e => e.trim().toLowerCase());
+
+// Require Admin Role
+const requireAdmin = (req, res, next) => {
+  try {
+    if (!req.user) {
+      return res.status(401).json({ 
+        success: false, 
+        error: 'Authentication required' 
+      });
+    }
+    
+    const userEmail = req.user.email.toLowerCase();
+    
+    if (!ADMIN_EMAILS.includes(userEmail) && !SUPER_ADMIN_EMAILS.includes(userEmail)) {
+      return res.status(403).json({ 
+        success: false, 
+        error: 'Admin access required' 
+      });
+    }
+    
+    req.isAdmin = true;
+    req.isSuperAdmin = SUPER_ADMIN_EMAILS.includes(userEmail);
+    next();
+  } catch (error) {
+    return res.status(403).json({ 
+      success: false, 
+      error: 'Admin verification failed' 
+    });
+  }
+};
+
+// Require Super Admin Role (for destructive operations)
+const requireSuperAdmin = (req, res, next) => {
+  try {
+    if (!req.user) {
+      return res.status(401).json({ 
+        success: false, 
+        error: 'Authentication required' 
+      });
+    }
+    
+    const userEmail = req.user.email.toLowerCase();
+    
+    if (!SUPER_ADMIN_EMAILS.includes(userEmail)) {
+      return res.status(403).json({ 
+        success: false, 
+        error: 'Super admin access required' 
+      });
+    }
+    
+    req.isSuperAdmin = true;
+    next();
+  } catch (error) {
+    return res.status(403).json({ 
+      success: false, 
+      error: 'Super admin verification failed' 
+    });
+  }
+};
+
+// Cron Job Authentication (secret token)
+const authenticateCron = (req, res, next) => {
+  const cronToken = req.headers['x-cron-token'] || req.query.token;
+  const validToken = process.env.CRON_SECRET_TOKEN || 'change-this-in-production';
+  
+  if (!cronToken || cronToken !== validToken) {
+    return res.status(401).json({ 
+      success: false, 
+      error: 'Invalid cron token' 
+    });
+  }
+  
+  next();
+};
+
+// Rate limiting for admin operations
+const rateLimitAdminOps = new Map();
+
+const rateLimitAdmin = (maxAttempts, windowMs) => {
+  return (req, res, next) => {
+    const key = `${req.user?.id || req.ip}-${req.path}`;
+    const now = Date.now();
+    
+    const attempts = rateLimitAdminOps.get(key) || [];
+    const recentAttempts = attempts.filter(time => now - time < windowMs);
+    
+    if (recentAttempts.length >= maxAttempts) {
+      return res.status(429).json({ 
+        success: false,
+        error: `Too many requests. Please wait ${Math.ceil(windowMs / 60000)} minutes.` 
+      });
+    }
+    
+    recentAttempts.push(now);
+    rateLimitAdminOps.set(key, recentAttempts);
+    
+    // Cleanup
+    if (Math.random() < 0.01) {
+      for (const [k, times] of rateLimitAdminOps.entries()) {
+        const filtered = times.filter(time => now - time < windowMs);
+        if (filtered.length === 0) {
+          rateLimitAdminOps.delete(k);
+        } else {
+          rateLimitAdminOps.set(k, filtered);
+        }
+      }
+    }
+    
+    next();
+  };
+};
+
+// ==========================================
+// HELPER FUNCTIONS
+// ==========================================
+
+// Enrich predictions with colors and flags (fixes N+1 problem with caching)
+const colorCache = new Map();
+async function enrichPredictions(predictions) {
+  for (const pred of predictions) {
+    // Use cache for colors to reduce API calls
+    const homeKey = `${pred.home_team}-${pred.home_logo}`;
+    const awayKey = `${pred.away_team}-${pred.away_logo}`;
+    
+    if (!colorCache.has(homeKey)) {
+      colorCache.set(homeKey, await getTeamColors(pred.home_team, pred.home_logo));
+    }
+    if (!colorCache.has(awayKey)) {
+      colorCache.set(awayKey, await getTeamColors(pred.away_team, pred.away_logo));
+    }
+    
+    pred.home_colors = colorCache.get(homeKey);
+    pred.away_colors = colorCache.get(awayKey);
+    
+    // Fix league flag
+    if (!pred.league_flag || pred.league_flag === '🌍') {
+      pred.league_flag = getLeagueFlag(pred.league);
+    }
+  }
+  return predictions;
+}
+
+// Clear color cache periodically (every 1 hour)
+setInterval(() => {
+  colorCache.clear();
+}, 3600000);
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
@@ -763,42 +917,101 @@ async function initDatabase() {
 
 initDatabase();
 
-// CLEANUP ENDPOINT - Delete old predictions
-app.post('/api/cleanup', async (req, res) => {
-  try {
-    // Delete predictions older than 2 days
-    const result = await pool.query(
-      `DELETE FROM predictions 
-       WHERE created_at < NOW() - INTERVAL '2 days' 
-       RETURNING id`
-    );
-    
-    res.json({ 
-      success: true, 
-      message: `Deleted ${result.rowCount} old predictions`,
-      count: result.rowCount 
-    });
-  } catch (error) {
-    console.error('❌ Cleanup error:', error);
-    res.status(500).json({ success: false, error: 'Cleanup failed' });
+// ==========================================
+// POST /api/cleanup (ADMIN ONLY - SECURE)
+// Delete old predictions (older than 2 days)
+// ==========================================
+app.post('/api/cleanup', 
+  authenticateToken,
+  requireAdmin,
+  rateLimitAdmin(5, 24 * 60 * 60 * 1000), // 5 per day
+  async (req, res) => {
+    try {
+      // Delete predictions older than 2 days
+      const result = await pool.query(
+        `DELETE FROM predictions 
+         WHERE created_at < NOW() - INTERVAL '2 days' 
+         RETURNING id`
+      );
+      
+      // Production-safe logging
+      if (process.env.NODE_ENV !== 'production') {
+        console.log(`Cleanup: Deleted ${result.rowCount} predictions by ${req.user.email}`);
+      }
+      
+      res.json({ 
+        success: true, 
+        message: `Deleted ${result.rowCount} old predictions`,
+        count: result.rowCount 
+      });
+    } catch (error) {
+      if (process.env.NODE_ENV !== 'production') {
+        console.error('Cleanup error:', error);
+      }
+      
+      res.status(500).json({ 
+        success: false, 
+        error: 'Cleanup operation failed' 
+      });
+    }
   }
-});
+);
 
-// DELETE ALL PREDICTIONS (dangerous - use carefully)
-app.delete('/api/predictions/all', async (req, res) => {
-  try {
-    const result = await pool.query('DELETE FROM predictions RETURNING id');
-    res.json({ 
-      success: true, 
-      message: `Deleted all ${result.rowCount} predictions`,
-      count: result.rowCount 
-    });
-  } catch (error) {
-    console.error('❌ Delete all error:', error);
-    res.status(500).json({ success: false, error: 'Delete failed' });
+// ==========================================
+// DELETE /api/predictions/all (SUPER ADMIN ONLY - EXTREMELY DANGEROUS)
+// Delete ALL predictions - requires confirmation
+// ==========================================
+app.delete('/api/predictions/all', 
+  authenticateToken,
+  requireSuperAdmin,
+  rateLimitAdmin(1, 60 * 60 * 1000), // 1 per hour
+  async (req, res) => {
+    try {
+      // Require explicit confirmation
+      const { confirm } = req.body;
+      
+      if (confirm !== true && confirm !== 'true') {
+        return res.status(400).json({ 
+          success: false, 
+          error: 'Confirmation required. Send { "confirm": true } to proceed.' 
+        });
+      }
+      
+      // Get count before deletion (for audit)
+      const countResult = await pool.query('SELECT COUNT(*) FROM predictions');
+      const totalCount = parseInt(countResult.rows[0].count);
+      
+      // Delete ALL predictions
+      const result = await pool.query('DELETE FROM predictions RETURNING id');
+      
+      // Production-safe logging (CRITICAL operation)
+      if (process.env.NODE_ENV !== 'production') {
+        console.log(`⚠️ CRITICAL: ALL PREDICTIONS DELETED (${result.rowCount}) by ${req.user.email}`);
+      }
+      
+      res.json({ 
+        success: true, 
+        message: `Deleted all ${result.rowCount} predictions`,
+        count: result.rowCount,
+        warning: 'This operation cannot be undone'
+      });
+    } catch (error) {
+      if (process.env.NODE_ENV !== 'production') {
+        console.error('Delete all error:', error);
+      }
+      
+      res.status(500).json({ 
+        success: false, 
+        error: 'Delete operation failed' 
+      });
+    }
   }
-});
+);
 
+// ==========================================
+// GET /api/matches/live (PUBLIC)
+// Get live matches from Football API
+// ==========================================
 app.get('/api/matches/live', async (req, res) => {
   try {
     const response = await axios.get('https://v3.football.api-sports.io/fixtures', {
@@ -813,19 +1026,31 @@ app.get('/api/matches/live', async (req, res) => {
     const matches = response.data.response;
     res.json({ success: true, count: matches.length, matches: matches });
   } catch (error) {
-    console.error('❌ Live matches:', error.message);
-    res.status(500).json({ success: false, error: 'Failed to fetch' });
+    if (process.env.NODE_ENV !== 'production') {
+      console.error('Live matches error:', error.message);
+    }
+    res.status(500).json({ success: false, error: 'Failed to fetch live matches' });
   }
 });
 
+// ==========================================
+// GET /api/matches/:id (PUBLIC)
+// Get specific match data from Football API
+// ==========================================
 app.get('/api/matches/:id', async (req, res) => {
   const matchId = req.params.id;
+  
+  // Validate ID
+  const matchIdNum = parseInt(matchId);
+  if (isNaN(matchIdNum) || matchIdNum <= 0) {
+    return res.status(400).json({ error: 'Invalid match ID' });
+  }
   
   try {
     const response = await axios.get(
       `https://v3.football.api-sports.io/fixtures`,
       {
-        params: { id: matchId },
+        params: { id: matchIdNum },
         headers: {
           'x-apisports-key': process.env.FOOTBALL_API_KEY || process.env.API_SPORTS_KEY
         }
@@ -849,15 +1074,21 @@ app.get('/api/matches/:id', async (req, res) => {
     });
     
   } catch (error) {
-    console.error('❌ Error fetching match:', error);
+    if (process.env.NODE_ENV !== 'production') {
+      console.error('Error fetching match:', error);
+    }
     res.status(500).json({ error: 'Failed to fetch match data' });
   }
 });
 
+// ==========================================
+// POST /api/matches/batch (PUBLIC - RATE LIMITED)
+// Get multiple matches in one request (optimized)
+// ==========================================
 app.post('/api/matches/batch', rateLimitBatch, async (req, res) => {
   const { matchIds } = req.body;
   
-  // Validasyon
+  // Input validation
   if (!matchIds || !Array.isArray(matchIds) || matchIds.length === 0) {
     return res.status(400).json({ error: 'matchIds array is required' });
   }
@@ -885,7 +1116,7 @@ app.post('/api/matches/batch', rateLimitBatch, async (req, res) => {
       return res.json([]);
     }
     
-    // Her maç için data formatla
+    // Format match data
     const matches = response.data.response.map(match => ({
       matchId: match.fixture.id,
       status: match.fixture.status.short,
@@ -900,7 +1131,9 @@ app.post('/api/matches/batch', rateLimitBatch, async (req, res) => {
     res.json(matches);
     
   } catch (error) {
-    console.error('❌ Error fetching batch matches:', error.message);
+    if (process.env.NODE_ENV !== 'production') {
+      console.error('Error fetching batch matches:', error.message);
+    }
     res.status(500).json({ error: 'Failed to fetch matches' });
   }
 });
@@ -927,82 +1160,174 @@ app.get('/api/predictions', async (req, res) => {
   }
 });
 
+// ==========================================
+// GET /api/predictions/active (PUBLIC - OPTIMIZED)
+// Get active predictions with pagination
+// ==========================================
 app.get('/api/predictions/active', async (req, res) => {
   try {
-    const result = await pool.query(
-      'SELECT * FROM predictions WHERE status = $1 ORDER BY created_at DESC',
+    // Pagination
+    const limit = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 100);
+    const offset = Math.max(parseInt(req.query.offset) || 0, 0);
+    
+    // Get total count
+    const countResult = await pool.query(
+      'SELECT COUNT(*) FROM predictions WHERE status = $1',
       ['active']
     );
+    const total = parseInt(countResult.rows[0].count);
     
-    // Her prediction için renk çıkar ve league_flag'i düzelt
-    for (const pred of result.rows) {
-      pred.home_colors = await getTeamColors(pred.home_team, pred.home_logo);
-      pred.away_colors = await getTeamColors(pred.away_team, pred.away_logo);
-      
-      // League flag düzelt
-      if (!pred.league_flag || pred.league_flag === '🌍') {
-        pred.league_flag = getLeagueFlag(pred.league);
-      }
-    }
-    
-    res.json({ success: true, predictions: result.rows });
-  } catch (error) {
-    console.error('Get active predictions error:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.get('/api/predictions/completed', async (req, res) => {
-  try {
+    // Get predictions with specific columns only
     const result = await pool.query(
-      'SELECT * FROM predictions WHERE status = $1 ORDER BY completed_at DESC NULLS LAST, created_at DESC',
-      ['completed']
+      `SELECT id, match_id, home_team, away_team, league, 
+              prediction_type, status, odds, confidence, 
+              home_logo, away_logo, league_flag, league_logo,
+              home_score, away_score, is_urgent, 
+              created_at, updated_at
+       FROM predictions 
+       WHERE status = $1 
+       ORDER BY created_at DESC 
+       LIMIT $2 OFFSET $3`,
+      ['active', limit, offset]
     );
     
-    // Her prediction için renk çıkar ve league_flag'i düzelt
-    for (const pred of result.rows) {
-      pred.home_colors = await getTeamColors(pred.home_team, pred.home_logo);
-      pred.away_colors = await getTeamColors(pred.away_team, pred.away_logo);
-      
-      // Database'de kaydedilen flag'i override et - eğer 🌍 ise league adından belirle
-      pred.league_flag = pred.league_flag === '🌍' || !pred.league_flag
-        ? getLeagueFlag(pred.league)
-        : pred.league_flag;
-    }
+    // Enrich with colors and flags (uses caching - N+1 fix)
+    const predictions = await enrichPredictions(result.rows);
     
-    res.json({ success: true, predictions: result.rows });
-  } catch (error) {
-    console.error('Get completed predictions error:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Test endpoint - Check completed predictions with scores
-app.get('/api/test/completed-predictions', async (req, res) => {
-  try {
-    const result = await pool.query(
-      `SELECT id, home_team, away_team, home_score, away_score, status, result, completed_at, prediction_type, match_id
-       FROM predictions
-       WHERE status = 'completed'
-       ORDER BY completed_at DESC NULLS LAST, created_at DESC
-       LIMIT 10`
-    );
-    
+    // Response with pagination metadata
     res.json({ 
       success: true, 
-      count: result.rows.length,
-      predictions: result.rows,
-      summary: {
-        withScores: result.rows.filter(p => p.home_score !== null && p.home_score !== undefined && p.away_score !== null && p.away_score !== undefined).length,
-        withoutScores: result.rows.filter(p => p.home_score === null || p.home_score === undefined || p.away_score === null || p.away_score === undefined).length,
-        zeroScores: result.rows.filter(p => p.home_score === 0 && p.away_score === 0).length
+      predictions: predictions,
+      pagination: {
+        total: total,
+        limit: limit,
+        offset: offset,
+        count: predictions.length,
+        hasMore: offset + limit < total,
+        page: Math.floor(offset / limit) + 1,
+        totalPages: Math.ceil(total / limit)
       }
     });
   } catch (error) {
-    console.error('Test query error:', error);
-    res.status(500).json({ error: error.message });
+    if (process.env.NODE_ENV !== 'production') {
+      console.error('Get active predictions error:', error);
+    }
+    
+    res.status(500).json({ 
+      success: false, 
+      error: 'Failed to fetch active predictions' 
+    });
   }
 });
+
+// ==========================================
+// GET /api/predictions/completed (PUBLIC - OPTIMIZED)
+// Get completed predictions with pagination
+// ==========================================
+app.get('/api/predictions/completed', async (req, res) => {
+  try {
+    // Pagination
+    const limit = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 100);
+    const offset = Math.max(parseInt(req.query.offset) || 0, 0);
+    
+    // Get total count
+    const countResult = await pool.query(
+      'SELECT COUNT(*) FROM predictions WHERE status = $1',
+      ['completed']
+    );
+    const total = parseInt(countResult.rows[0].count);
+    
+    // Get predictions with specific columns
+    const result = await pool.query(
+      `SELECT id, match_id, home_team, away_team, league, 
+              prediction_type, status, result, odds, confidence, 
+              home_logo, away_logo, league_flag, league_logo,
+              home_score, away_score, is_urgent, 
+              created_at, updated_at, completed_at
+       FROM predictions 
+       WHERE status = $1 
+       ORDER BY completed_at DESC NULLS LAST, created_at DESC 
+       LIMIT $2 OFFSET $3`,
+      ['completed', limit, offset]
+    );
+    
+    // Enrich with colors and flags (uses caching - N+1 fix)
+    const predictions = await enrichPredictions(result.rows);
+    
+    // Response with pagination metadata
+    res.json({ 
+      success: true, 
+      predictions: predictions,
+      pagination: {
+        total: total,
+        limit: limit,
+        offset: offset,
+        count: predictions.length,
+        hasMore: offset + limit < total,
+        page: Math.floor(offset / limit) + 1,
+        totalPages: Math.ceil(total / limit)
+      }
+    });
+  } catch (error) {
+    if (process.env.NODE_ENV !== 'production') {
+      console.error('Get completed predictions error:', error);
+    }
+    
+    res.status(500).json({ 
+      success: false, 
+      error: 'Failed to fetch completed predictions' 
+    });
+  }
+});
+
+// ==========================================
+// GET /api/test/completed-predictions (TEST ONLY - DISABLED IN PRODUCTION)
+// Test endpoint - check completed predictions with scores
+// ==========================================
+app.get('/api/test/completed-predictions', 
+  (req, res, next) => {
+    // Disable in production
+    if (process.env.NODE_ENV === 'production') {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'Test endpoint not available in production' 
+      });
+    }
+    next();
+  },
+  async (req, res) => {
+    try {
+      const result = await pool.query(
+        `SELECT id, home_team, away_team, home_score, away_score, 
+                status, result, completed_at, prediction_type, match_id
+         FROM predictions
+         WHERE status = 'completed'
+         ORDER BY completed_at DESC NULLS LAST, created_at DESC
+         LIMIT 10`
+      );
+      
+      res.json({ 
+        success: true, 
+        count: result.rows.length,
+        predictions: result.rows,
+        summary: {
+          withScores: result.rows.filter(p => p.home_score !== null && p.away_score !== null).length,
+          withoutScores: result.rows.filter(p => p.home_score === null || p.away_score === null).length,
+          zeroScores: result.rows.filter(p => p.home_score === 0 && p.away_score === 0).length
+        }
+      });
+    } catch (error) {
+      if (process.env.NODE_ENV !== 'production') {
+        console.error('Test query error:', error);
+      }
+      
+      res.status(500).json({ 
+        success: false, 
+        error: 'Test query failed' 
+      });
+    }
+  }
+);
 
 app.post('/api/predictions', async (req, res) => {
   try {
@@ -1040,44 +1365,165 @@ app.post('/api/predictions', async (req, res) => {
   }
 });
 
-app.put('/api/predictions/:id/result', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { result } = req.body;
-
-    await pool.query(
-      'UPDATE predictions SET status = $1, result = $1, updated_at = NOW() WHERE id = $2',
-      [result, id]
-    );
-
-    res.json({ success: true });
-  } catch (error) {
-    console.error('❌ Update result:', error);
-    res.status(500).json({ success: false, error: 'Failed' });
+// ==========================================
+// PUT /api/predictions/:id/result (ADMIN ONLY - SECURE)
+// Update prediction result (won/lost/void)
+// ==========================================
+app.put('/api/predictions/:id/result', 
+  authenticateToken,
+  requireAdmin,
+  rateLimitAdmin(20, 60 * 1000), // 20 per minute
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { result } = req.body;
+      
+      // Validate ID is integer
+      const predictionId = parseInt(id);
+      if (isNaN(predictionId) || predictionId <= 0) {
+        return res.status(400).json({ 
+          success: false, 
+          error: 'Invalid prediction ID' 
+        });
+      }
+      
+      // Validate result enum
+      const validResults = ['won', 'lost', 'void'];
+      if (!result || !validResults.includes(result)) {
+        return res.status(400).json({ 
+          success: false, 
+          error: `Result must be one of: ${validResults.join(', ')}` 
+        });
+      }
+      
+      // Check prediction exists
+      const existingCheck = await pool.query(
+        'SELECT id, status, result FROM predictions WHERE id = $1',
+        [predictionId]
+      );
+      
+      if (existingCheck.rows.length === 0) {
+        return res.status(404).json({ 
+          success: false, 
+          error: 'Prediction not found' 
+        });
+      }
+      
+      // Check if already has a result
+      const existing = existingCheck.rows[0];
+      if (existing.result && existing.result !== null) {
+        return res.status(409).json({ 
+          success: false, 
+          error: `Prediction already has result: ${existing.result}. Cannot modify.`,
+          currentResult: existing.result
+        });
+      }
+      
+      // Update prediction
+      await pool.query(
+        'UPDATE predictions SET status = $1, result = $2, completed_at = NOW(), updated_at = NOW() WHERE id = $3',
+        ['completed', result, predictionId]
+      );
+      
+      res.json({ 
+        success: true,
+        message: 'Prediction result updated',
+        predictionId: predictionId,
+        result: result
+      });
+    } catch (error) {
+      if (process.env.NODE_ENV !== 'production') {
+        console.error('Update result error:', error);
+      }
+      
+      res.status(500).json({ 
+        success: false, 
+        error: 'Failed to update prediction result' 
+      });
+    }
   }
-});
+);
 
-app.delete('/api/predictions/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    await pool.query('DELETE FROM predictions WHERE id = $1', [id]);
-    res.json({ success: true });
-  } catch (error) {
-    console.error('❌ Delete:', error);
-    res.status(500).json({ success: false, error: 'Failed' });
+// ==========================================
+// DELETE /api/predictions/:id (ADMIN ONLY - SOFT DELETE)
+// Soft delete prediction (marks as deleted instead of removing)
+// ==========================================
+app.delete('/api/predictions/:id', 
+  authenticateToken,
+  requireAdmin,
+  rateLimitAdmin(10, 60 * 1000), // 10 per minute
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      
+      // Validate ID
+      const predictionId = parseInt(id);
+      if (isNaN(predictionId) || predictionId <= 0) {
+        return res.status(400).json({ 
+          success: false, 
+          error: 'Invalid prediction ID' 
+        });
+      }
+      
+      // Check if prediction exists
+      const existingCheck = await pool.query(
+        'SELECT id FROM predictions WHERE id = $1',
+        [predictionId]
+      );
+      
+      if (existingCheck.rows.length === 0) {
+        return res.status(404).json({ 
+          success: false, 
+          error: 'Prediction not found' 
+        });
+      }
+      
+      // Soft delete (mark as cancelled instead of removing)
+      await pool.query(
+        'UPDATE predictions SET status = $1, updated_at = NOW() WHERE id = $2',
+        ['cancelled', predictionId]
+      );
+      
+      res.json({ 
+        success: true,
+        message: 'Prediction marked as cancelled',
+        predictionId: predictionId
+      });
+    } catch (error) {
+      if (process.env.NODE_ENV !== 'production') {
+        console.error('Delete prediction error:', error);
+      }
+      
+      res.status(500).json({ 
+        success: false, 
+        error: 'Failed to delete prediction' 
+      });
+    }
   }
-});
+);
 
-app.get('/api/cron/update-scores', async (req, res) => {
-  try {
-    console.log('🕐 [CRON] Checking predictions...');
-    // Aktif ve tamamlanmış tahminleri çek (FT olunca skorları güncellemek için)
-    const predictions = await pool.query(
-      'SELECT * FROM predictions WHERE status IN ($1, $2)',
-      ['active', 'completed']
-    );
+// ==========================================
+// GET /api/cron/update-scores (CRON ONLY - SECURE)
+// Update prediction scores from Football API
+// ==========================================
+app.get('/api/cron/update-scores', 
+  authenticateCron,
+  rateLimitAdmin(10, 60 * 1000), // 10 per minute
+  async (req, res) => {
+    try {
+      if (process.env.NODE_ENV !== 'production') {
+        console.log('[CRON] Checking predictions...');
+      }
+      
+      // Get active and completed predictions
+      const predictions = await pool.query(
+        'SELECT * FROM predictions WHERE status IN ($1, $2)',
+        ['active', 'completed']
+      );
 
-    console.log(`📊 Found ${predictions.rows.length} predictions to check`);
+      if (process.env.NODE_ENV !== 'production') {
+        console.log(`Found ${predictions.rows.length} predictions to check`);
+      }
     let updated = 0;
     let scoreUpdated = 0;
 
@@ -1097,7 +1543,9 @@ app.get('/api/cron/update-scores', async (req, res) => {
         const fixture = data.response[0];
         
         if (!fixture) {
-          console.log(`⚠️ No fixture found for match_id: ${pred.match_id}`);
+          if (process.env.NODE_ENV !== 'production') {
+            console.log(`No fixture found for match_id: ${pred.match_id}`);
+          }
           continue;
         }
         
@@ -1107,7 +1555,9 @@ app.get('/api/cron/update-scores', async (req, res) => {
         
         // API'den skor gelmiyorsa logla
         if (homeGoals === null || awayGoals === null) {
-          console.log(`⚠️ Match ${pred.match_id} - Goals are null: home=${homeGoals}, away=${awayGoals}, status=${statusShort}`);
+          if (process.env.NODE_ENV !== 'production') {
+            console.log(`Match ${pred.match_id} - Goals are null: home=${homeGoals}, away=${awayGoals}, status=${statusShort}`);
+          }
         }
         
         const homeScore = homeGoals !== null ? homeGoals : 0;
@@ -1207,7 +1657,9 @@ app.get('/api/cron/update-scores', async (req, res) => {
             [homeScore, awayScore, pred.id]
           );
           scoreUpdated++;
-          console.log(`📊 Updated scores for #${pred.id}: ${homeScore}-${awayScore}`);
+          if (process.env.NODE_ENV !== 'production') {
+            console.log(`Updated scores for #${pred.id}: ${homeScore}-${awayScore}`);
+          }
         }
         
         // Skor + result güncelleme
@@ -1217,20 +1669,34 @@ app.get('/api/cron/update-scores', async (req, res) => {
             [homeScore, awayScore, 'completed', result, pred.id]
           );
           updated++;
-          console.log(`✅ Completed #${pred.id}: ${result.toUpperCase()} (${homeScore}-${awayScore})`);
+          if (process.env.NODE_ENV !== 'production') {
+            console.log(`Completed #${pred.id}: ${result.toUpperCase()} (${homeScore}-${awayScore})`);
+          }
         }
       } catch (err) {
-        console.error(`❌ Error updating prediction #${pred.id}:`, err.message);
+        if (process.env.NODE_ENV !== 'production') {
+          console.error(`Error updating prediction #${pred.id}:`, err.message);
+        }
       }
     }
 
-    console.log(`✅ Cron job completed: ${updated} predictions completed, ${scoreUpdated} scores updated`);
-    res.json({ success: true, updated, scoreUpdated, total: predictions.rows.length });
-  } catch (error) {
-    console.error('❌ Update scores error:', error);
-    res.status(500).json({ error: error.message });
+      if (process.env.NODE_ENV !== 'production') {
+        console.log(`Cron completed: ${updated} predictions completed, ${scoreUpdated} scores updated`);
+      }
+      
+      res.json({ success: true, updated, scoreUpdated, total: predictions.rows.length });
+    } catch (error) {
+      if (process.env.NODE_ENV !== 'production') {
+        console.error('Update scores error:', error);
+      }
+      
+      res.status(500).json({ 
+        success: false, 
+        error: 'Failed to update scores' 
+      });
+    }
   }
-});
+);
 
 app.get('/health', async (req, res) => {
   try {
@@ -1501,119 +1967,218 @@ async function addVIPDays(userId, days) {
 // REFERRAL SYSTEM - API Endpoints
 // ==========================================
 
-// GET /api/user/referral-info
-app.get('/api/user/referral-info', async (req, res) => {
-  try {
-    const { userId } = req.query;
-    
-    if (!userId) {
-      return res.status(400).json({ success: false, error: 'userId is required' });
-    }
-    
-    const result = await pool.query(
-      'SELECT referral_code, referral_count, vip_bonus_days, referred_by FROM users WHERE id = $1',
-      [userId]
-    );
-    
-    if (result.rows.length === 0) {
-      return res.status(404).json({ success: false, error: 'User not found' });
-    }
-    
-    const user = result.rows[0];
-    res.json({
-      success: true,
-      referral_code: user.referral_code || null,
-      referral_count: user.referral_count || 0,
-      vip_bonus_days: user.vip_bonus_days || 0,
-      referred_by: user.referred_by || null
-    });
-  } catch (error) {
-    console.error('❌ Get referral info error:', error);
-    res.status(500).json({ success: false, error: 'Failed to get referral info' });
-  }
-});
-
-// POST /api/referral/validate
-app.post('/api/referral/validate', async (req, res) => {
-  try {
-    const { referral_code } = req.body;
-    
-    if (!referral_code) {
-      return res.status(400).json({ success: false, valid: false, message: 'Referral code is required' });
-    }
-    
-    // Check if referral code exists
-    const result = await pool.query(
-      'SELECT id, referral_count FROM users WHERE referral_code = $1',
-      [referral_code.toUpperCase()]
-    );
-    
-    if (result.rows.length === 0) {
-      return res.json({ success: true, valid: false, message: 'Invalid referral code' });
-    }
-    
-    const user = result.rows[0];
-    const referralCount = user.referral_count || 0;
-    
-    // Check if referrer has reached max quota (2)
-    if (referralCount >= 2) {
-      return res.json({ 
-        success: true, 
-        valid: false, 
-        message: 'This referral code has reached its maximum referrals' 
+// ==========================================
+// GET /api/user/referral-info (USER ONLY - SECURE)
+// Get referral info for authenticated user
+// ==========================================
+app.get('/api/user/referral-info', 
+  authenticateToken,
+  async (req, res) => {
+    try {
+      // Get userId from token (NOT from client)
+      const userId = req.user.id;
+      
+      const result = await pool.query(
+        'SELECT referral_code, referral_count, vip_bonus_days, referred_by FROM users WHERE id = $1',
+        [userId]
+      );
+      
+      if (result.rows.length === 0) {
+        return res.status(404).json({ 
+          success: false, 
+          error: 'User not found' 
+        });
+      }
+      
+      const user = result.rows[0];
+      res.json({
+        success: true,
+        referral_code: user.referral_code || null,
+        referral_count: user.referral_count || 0,
+        vip_bonus_days: user.vip_bonus_days || 0,
+        referred_by: user.referred_by || null
+      });
+    } catch (error) {
+      if (process.env.NODE_ENV !== 'production') {
+        console.error('Get referral info error:', error);
+      }
+      
+      res.status(500).json({ 
+        success: false, 
+        error: 'Failed to get referral info' 
       });
     }
-    
-    res.json({ success: true, valid: true, message: 'Referral code is valid' });
-  } catch (error) {
-    console.error('❌ Validate referral error:', error);
-    res.status(500).json({ success: false, valid: false, message: 'Failed to validate referral code' });
   }
-});
+);
 
-// GET /api/referral/history
-app.get('/api/referral/history', async (req, res) => {
-  try {
-    const { userId } = req.query;
-    
-    if (!userId) {
-      return res.status(400).json({ success: false, error: 'userId is required' });
+// ==========================================
+// POST /api/referral/validate (PUBLIC - RATE LIMITED)
+// Validate referral code
+// ==========================================
+app.post('/api/referral/validate', 
+  rateLimitPayment, // Reuse existing rate limiter (3 per 15 min)
+  async (req, res) => {
+    try {
+      const { referral_code } = req.body;
+      
+      // Input validation
+      if (!referral_code) {
+        return res.status(400).json({ 
+          success: false, 
+          valid: false, 
+          message: 'Referral code is required' 
+        });
+      }
+      
+      // Code format validation (alphanumeric, 6-20 chars)
+      if (!/^[A-Z0-9]{6,20}$/i.test(referral_code)) {
+        return res.json({ 
+          success: true, 
+          valid: false, 
+          message: 'Invalid referral code format' 
+        });
+      }
+      
+      // XSS protection (sanitize)
+      const sanitizedCode = referral_code.toUpperCase().trim();
+      
+      // Check if referral code exists
+      const result = await pool.query(
+        'SELECT id, referral_count FROM users WHERE referral_code = $1',
+        [sanitizedCode]
+      );
+      
+      if (result.rows.length === 0) {
+        return res.json({ 
+          success: true, 
+          valid: false, 
+          message: 'Invalid referral code' 
+        });
+      }
+      
+      const user = result.rows[0];
+      const referralCount = user.referral_count || 0;
+      
+      // Check if referrer has reached max quota (2)
+      if (referralCount >= 2) {
+        return res.json({ 
+          success: true, 
+          valid: false, 
+          message: 'This referral code has reached its maximum referrals' 
+        });
+      }
+      
+      res.json({ 
+        success: true, 
+        valid: true, 
+        message: 'Referral code is valid' 
+      });
+    } catch (error) {
+      if (process.env.NODE_ENV !== 'production') {
+        console.error('Validate referral error:', error);
+      }
+      
+      res.status(500).json({ 
+        success: false, 
+        valid: false, 
+        message: 'Failed to validate referral code' 
+      });
     }
-    
-    const result = await pool.query(
-      `SELECT referred_email, created_at, bonus_given 
-       FROM referrals 
-       WHERE referrer_user_id = $1 
-       ORDER BY created_at DESC`,
-      [userId]
-    );
-    
-    res.json({
-      success: true,
-      referrals: result.rows.map(row => ({
-        referred_email: row.referred_email,
-        created_at: row.created_at,
-        bonus_given: row.bonus_given
-      }))
-    });
-  } catch (error) {
-    console.error('❌ Get referral history error:', error);
-    res.status(500).json({ success: false, error: 'Failed to get referral history' });
   }
-});
+);
+
+// ==========================================
+// GET /api/referral/history (USER ONLY - SECURE)
+// Get referral history for authenticated user with pagination
+// ==========================================
+app.get('/api/referral/history', 
+  authenticateToken,
+  async (req, res) => {
+    try {
+      // Get userId from token (NOT from client)
+      const userId = req.user.id;
+      
+      // Pagination
+      const limit = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 100);
+      const offset = Math.max(parseInt(req.query.offset) || 0, 0);
+      
+      // Get total count
+      const countResult = await pool.query(
+        'SELECT COUNT(*) FROM referrals WHERE referrer_user_id = $1',
+        [userId]
+      );
+      const total = parseInt(countResult.rows[0].count);
+      
+      // Get referral history
+      const result = await pool.query(
+        `SELECT referred_email, created_at, bonus_given 
+         FROM referrals 
+         WHERE referrer_user_id = $1 
+         ORDER BY created_at DESC
+         LIMIT $2 OFFSET $3`,
+        [userId, limit, offset]
+      );
+      
+      res.json({
+        success: true,
+        referrals: result.rows.map(row => ({
+          referred_email: row.referred_email,
+          created_at: row.created_at,
+          bonus_given: row.bonus_given
+        })),
+        pagination: {
+          total: total,
+          limit: limit,
+          offset: offset,
+          count: result.rows.length,
+          hasMore: offset + limit < total
+        }
+      });
+    } catch (error) {
+      if (process.env.NODE_ENV !== 'production') {
+        console.error('Get referral history error:', error);
+      }
+      
+      res.status(500).json({ 
+        success: false, 
+        error: 'Failed to get referral history' 
+      });
+    }
+  }
+);
 
 // ==========================================
 // REVENUECAT WEBHOOK
 // ==========================================
 
+// ==========================================
+// POST /api/webhook/revenuecat (WEBHOOK - SECURE)
+// RevenueCat webhook handler with validation
+// ==========================================
 app.post("/api/webhook/revenuecat", async (req, res) => {
   try {
     const event = req.body;
-    console.log("🔔 RevenueCat webhook:", event.type);
     
+    // Validate webhook payload
+    if (!event.type || !event.app_user_id) {
+      return res.status(400).json({ 
+        error: 'Invalid webhook payload' 
+      });
+    }
+    
+    // Production-safe logging
+    if (process.env.NODE_ENV !== 'production') {
+      console.log("RevenueCat webhook:", event.type);
+    }
+    
+    // Process purchase events
     if (event.type === "INITIAL_PURCHASE" || event.type === "RENEWAL") {
       const userId = event.app_user_id;
       const productId = event.product_id;
+      
+      if (!userId || !productId) {
+        return res.status(400).json({ error: 'Missing userId or productId' });
+      }
       
       if (productId === "com.flashgoal.vip.24h") {
         const expiryDate = new Date();
@@ -1626,9 +2191,17 @@ app.post("/api/webhook/revenuecat", async (req, res) => {
            DO UPDATE SET expiry_date = $2, product_id = $3, updated_at = NOW()`,
           [userId, expiryDate, productId]
         );
-        console.log(`✅ 24h VIP activated for user: ${userId}`);
+        
+        if (process.env.NODE_ENV !== 'production') {
+          console.log(`24h VIP activated for user: ${userId}`);
+        }
       } else {
         const expiryDate = new Date(event.expiration_at_ms);
+        
+        if (isNaN(expiryDate.getTime())) {
+          return res.status(400).json({ error: 'Invalid expiration date' });
+        }
+        
         await pool.query(
           `INSERT INTO vip_access (user_id, expiry_date, product_id) 
            VALUES ($1, $2, $3)
@@ -1636,12 +2209,18 @@ app.post("/api/webhook/revenuecat", async (req, res) => {
            DO UPDATE SET expiry_date = $2, product_id = $3, updated_at = NOW()`,
           [userId, expiryDate, productId]
         );
-        console.log(`✅ Subscription activated for user: ${userId}`);
+        
+        if (process.env.NODE_ENV !== 'production') {
+          console.log(`Subscription activated for user: ${userId}`);
+        }
       }
     }
+    
     res.status(200).send("OK");
   } catch (error) {
-    console.error("❌ Webhook error:", error);
+    if (process.env.NODE_ENV !== 'production') {
+      console.error("Webhook error:", error);
+    }
     res.status(500).send("Error");
   }
 });
