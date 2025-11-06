@@ -2623,38 +2623,273 @@ app.post('/api/payments/create-checkout-session',
   }
 );
 
-// Verify payment and activate VIP
-app.post('/api/payments/verify', async (req, res) => {
-  try {
-    const { paymentIntentId, userId, productId, days } = req.body;
-
-    const paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId);
-
-    if (paymentIntent.status === 'succeeded') {
+// ==========================================
+// POST /api/payments/verify
+// SECURE PAYMENT VERIFICATION (JWT + Ownership Check + Idempotent)
+// ==========================================
+app.post('/api/payments/verify', 
+  authenticateToken,      // 1️⃣ JWT Authentication (req.user from token)
+  rateLimitPayment,       // 2️⃣ Rate limiting (5 attempts per 15 min)
+  async (req, res) => {
+    const ip = req.ip || req.connection.remoteAddress;
+    
+    try {
+      // ========================================
+      // 3️⃣ INPUT VALIDATION
+      // ========================================
+      const { sessionId } = req.body;
+      
+      // Validate sessionId required
+      if (!sessionId) {
+        return res.status(400).json({ 
+          success: false, 
+          error: 'Session ID is required' 
+        });
+      }
+      
+      // Validate sessionId format (Stripe checkout session format)
+      if (!sessionId.startsWith('cs_')) {
+        return res.status(400).json({ 
+          success: false, 
+          error: 'Invalid session ID format' 
+        });
+      }
+      
+      // ========================================
+      // 4️⃣ DUPLICATE PAYMENT CHECK (Idempotent)
+      // Critical: Same payment should not activate VIP twice
+      // ========================================
+      const existingPayment = await pool.query(
+        `SELECT id, status, user_id FROM payment_attempts 
+         WHERE stripe_session_id = $1`,
+        [sessionId]
+      );
+      
+      if (existingPayment.rows.length > 0) {
+        const payment = existingPayment.rows[0];
+        
+        // If already completed, return success (idempotent behavior)
+        if (payment.status === 'completed') {
+          // Get VIP info for response
+          const vipInfo = await pool.query(
+            'SELECT expiry_date, product_id FROM vip_access WHERE user_id = $1',
+            [payment.user_id]
+          );
+          
+          return res.json({
+            success: true,
+            message: 'Payment already processed',
+            alreadyProcessed: true,
+            vipExpiresAt: vipInfo.rows[0]?.expiry_date || null
+          });
+        }
+        
+        // If failed before, allow retry (don't block legitimate retries)
+        if (payment.status === 'failed') {
+          // Continue to process
+        }
+      }
+      
+      // ========================================
+      // 5️⃣ RETRIEVE STRIPE CHECKOUT SESSION
+      // Get ALL data from Stripe - NEVER trust client
+      // ========================================
+      const session = await stripe.checkout.sessions.retrieve(sessionId);
+      
+      // ========================================
+      // 6️⃣ PAYMENT STATUS VERIFICATION
+      // ========================================
+      if (session.payment_status !== 'paid') {
+        return res.status(400).json({ 
+          success: false, 
+          error: 'Payment not completed',
+          paymentStatus: session.payment_status
+        });
+      }
+      
+      // ========================================
+      // 7️⃣ EXTRACT DATA FROM STRIPE METADATA
+      // CRITICAL: Get userId, productId, days from Stripe (NOT client!)
+      // ========================================
+      const stripeUserId = session.metadata?.userId;
+      const productId = session.metadata?.productId;
+      const days = parseInt(session.metadata?.days || '0');
+      const amount = parseInt(session.metadata?.amount || '0');
+      
+      // Validate metadata exists
+      if (!stripeUserId || !productId || !days) {
+        return res.status(400).json({ 
+          success: false, 
+          error: 'Invalid payment metadata' 
+        });
+      }
+      
+      // ========================================
+      // 8️⃣ OWNERSHIP VERIFICATION (CRITICAL SECURITY)
+      // Verify that the authenticated user owns this payment
+      // ========================================
+      if (stripeUserId !== req.user.id.toString()) {
+        // Log suspicious activity
+        await pool.query(
+          `INSERT INTO payment_attempts 
+           (user_id, product_id, amount, stripe_session_id, status, ip_address, user_agent)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+          [
+            req.user.id,
+            'suspicious',
+            0,
+            sessionId,
+            'unauthorized_access_attempt',
+            ip,
+            req.headers['user-agent'] || 'unknown'
+          ]
+        );
+        
+        return res.status(403).json({ 
+          success: false, 
+          error: 'This payment does not belong to you' 
+        });
+      }
+      
+      // ========================================
+      // 9️⃣ VIP ACTIVATION (Server-controlled)
+      // ========================================
+      
+      // Calculate expiry date (from Stripe metadata - server-controlled)
       const expiryDate = new Date();
       expiryDate.setDate(expiryDate.getDate() + days);
-
-      await pool.query(
-        `INSERT INTO vip_access (user_id, product_id, expiry_date) 
-         VALUES ($1, $2, $3)
-         ON CONFLICT (user_id) 
-         DO UPDATE SET product_id = $2, expiry_date = $3`,
-        [userId, productId, expiryDate]
-      );
-
-      res.json({ 
-        success: true, 
-        message: 'VIP activated',
-        expiryDate: expiryDate
+      
+      // ========================================
+      // 🔟 DATABASE TRANSACTION (Atomic Operation)
+      // Either both succeed or both fail
+      // ========================================
+      await pool.query('BEGIN');
+      
+      try {
+        // Update payment_attempts table
+        await pool.query(
+          `UPDATE payment_attempts 
+           SET status = $1, updated_at = NOW() 
+           WHERE stripe_session_id = $2`,
+          ['completed', sessionId]
+        );
+        
+        // If no rows updated, insert new record
+        const updateResult = await pool.query(
+          'SELECT id FROM payment_attempts WHERE stripe_session_id = $1',
+          [sessionId]
+        );
+        
+        if (updateResult.rows.length === 0) {
+          await pool.query(
+            `INSERT INTO payment_attempts 
+             (user_id, product_id, amount, currency, stripe_session_id, status, ip_address, user_agent)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+            [
+              req.user.id,
+              productId,
+              amount,
+              'try',
+              sessionId,
+              'completed',
+              ip,
+              req.headers['user-agent'] || 'unknown'
+            ]
+          );
+        }
+        
+        // Activate VIP access
+        await pool.query(
+          `INSERT INTO vip_access (user_id, product_id, expiry_date) 
+           VALUES ($1, $2, $3)
+           ON CONFLICT (user_id) 
+           DO UPDATE SET 
+             product_id = $2, 
+             expiry_date = CASE 
+               WHEN vip_access.expiry_date > NOW() 
+               THEN vip_access.expiry_date + ($3 - NOW())
+               ELSE $3
+             END,
+             updated_at = NOW()`,
+          [req.user.id, productId, expiryDate]
+        );
+        
+        // Commit transaction
+        await pool.query('COMMIT');
+        
+      } catch (dbError) {
+        // Rollback on any error
+        await pool.query('ROLLBACK');
+        throw dbError;
+      }
+      
+      // ========================================
+      // ⓫ SUCCESS RESPONSE
+      // ========================================
+      res.json({
+        success: true,
+        message: 'VIP activated successfully',
+        vipExpiresAt: expiryDate,
+        product: {
+          id: productId,
+          days: days
+        },
+        payment: {
+          sessionId: sessionId,
+          amount: amount / 100, // Convert cents to TRY
+          currency: 'try'
+        }
       });
-    } else {
-      res.status(400).json({ success: false, error: 'Payment not completed' });
+      
+    } catch (error) {
+      // ========================================
+      // ⓬ PRODUCTION-SAFE ERROR HANDLING
+      // ========================================
+      
+      // Log error in development only (NEVER expose to client)
+      if (process.env.NODE_ENV !== 'production') {
+        console.error('Payment verification error:', error);
+      }
+      
+      // Log failed verification attempt to database
+      try {
+        await pool.query(
+          `INSERT INTO payment_attempts 
+           (user_id, product_id, amount, stripe_session_id, status, ip_address, user_agent)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+          [
+            req.user?.id || null,
+            'unknown',
+            0,
+            req.body.sessionId || 'unknown',
+            'failed',
+            ip,
+            req.headers['user-agent'] || 'unknown'
+          ]
+        );
+      } catch (logError) {
+        // Silent fail for logging errors
+        if (process.env.NODE_ENV !== 'production') {
+          console.error('Failed to log error:', logError);
+        }
+      }
+      
+      // Handle specific Stripe errors
+      if (error.type === 'StripeInvalidRequestError') {
+        return res.status(400).json({ 
+          success: false, 
+          error: 'Invalid session ID' 
+        });
+      }
+      
+      // Generic user-friendly error (NO sensitive data)
+      res.status(500).json({ 
+        success: false, 
+        error: 'Payment verification failed. Please contact support if payment was successful.' 
+      });
     }
-  } catch (error) {
-    console.error('Payment verification error:', error);
-    res.status(500).json({ success: false, error: error.message });
   }
-});
+);
 
 // Get Stripe publishable key
 app.get('/api/payments/config', (req, res) => {
