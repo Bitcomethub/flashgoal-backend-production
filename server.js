@@ -2686,7 +2686,32 @@ app.get("/api/vip/check/:userId", async (req, res) => {
     );
     const isVIP = result.rows.length > 0;
     const expiryDate = isVIP ? result.rows[0].expiry_date : null;
-    res.json({ success: true, isVIP, expiryDate, productId: isVIP ? result.rows[0].product_id : null });
+    
+    // Calculate VIP package type based on remaining days
+    let vipPackage = null;
+    if (isVIP && expiryDate) {
+      const expiry = new Date(expiryDate);
+      const now = new Date();
+      const daysRemaining = Math.ceil((expiry - now) / (1000 * 60 * 60 * 24));
+      
+      if (daysRemaining <= 7) {
+        vipPackage = 'weekly';
+      } else if (daysRemaining <= 30) {
+        vipPackage = 'monthly';
+      } else if (daysRemaining <= 90) {
+        vipPackage = '3-monthly';
+      } else {
+        vipPackage = 'yearly';
+      }
+    }
+    
+    res.json({ 
+      success: true, 
+      isVIP, 
+      expiryDate, 
+      vipPackage,
+      productId: isVIP ? result.rows[0].product_id : null 
+    });
   } catch (error) {
     console.error("Error checking VIP:", error);
     res.status(500).json({ success: false, error: error.message });
@@ -3004,6 +3029,27 @@ app.post('/api/auth/login', rateLimitLogin, async (req, res) => {
     const vipExpiresAt = isVIP ? vipCheck.rows[0].expiry_date : null;
     
     // ========================================
+    // 6.5. Calculate VIP package type based on remaining days
+    // ========================================
+    let vipPackage = null;
+    if (isVIP && vipExpiresAt) {
+      const expiryDate = new Date(vipExpiresAt);
+      const now = new Date();
+      const daysRemaining = Math.ceil((expiryDate - now) / (1000 * 60 * 60 * 24));
+      
+      // Determine package type based on remaining days
+      if (daysRemaining <= 7) {
+        vipPackage = 'weekly';
+      } else if (daysRemaining <= 30) {
+        vipPackage = 'monthly';
+      } else if (daysRemaining <= 90) {
+        vipPackage = '3-monthly';
+      } else {
+        vipPackage = 'yearly';
+      }
+    }
+    
+    // ========================================
     // 7. Generate JWT token
     // ========================================
     const token = jwt.sign(
@@ -3026,6 +3072,7 @@ app.post('/api/auth/login', rateLimitLogin, async (req, res) => {
       userId: user.id,
       isVIP,
       vipExpiresAt,
+      vipPackage,
       user: { 
         email: user.email, 
         name: user.name 
@@ -3116,6 +3163,27 @@ app.get('/api/auth/validate', async (req, res) => {
     const vipExpiresAt = isVIP ? vipResult.rows[0].expiry_date : null;
     
     // ========================================
+    // 6.5. Calculate VIP package type based on remaining days
+    // ========================================
+    let vipPackage = null;
+    if (isVIP && vipExpiresAt) {
+      const expiryDate = new Date(vipExpiresAt);
+      const now = new Date();
+      const daysRemaining = Math.ceil((expiryDate - now) / (1000 * 60 * 60 * 24));
+      
+      // Determine package type based on remaining days
+      if (daysRemaining <= 7) {
+        vipPackage = 'weekly';
+      } else if (daysRemaining <= 30) {
+        vipPackage = 'monthly';
+      } else if (daysRemaining <= 90) {
+        vipPackage = '3-monthly';
+      } else {
+        vipPackage = 'yearly';
+      }
+    }
+    
+    // ========================================
     // 7. Return success response (200 OK)
     // ========================================
     res.json({ 
@@ -3123,6 +3191,7 @@ app.get('/api/auth/validate', async (req, res) => {
       userId: user.id,
       isVIP,
       vipExpiresAt,
+      vipPackage,
       user: {
         email: user.email,
         name: user.name
