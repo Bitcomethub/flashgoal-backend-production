@@ -10,6 +10,7 @@ const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const nodemailer = require('nodemailer');
 const crypto = require('crypto');
+const { calculateSmartRisk } = require('./backend/utils/riskCalculator');
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -826,6 +827,69 @@ async function initDatabase() {
       }
     }
     
+    // ==========================================
+    // RISK BADGE SYSTEM - Database Migration
+    // ==========================================
+    try {
+      // Add risk badge columns to predictions table
+      await pool.query(`
+        ALTER TABLE predictions 
+        ADD COLUMN IF NOT EXISTS filter_name VARCHAR(50)
+      `);
+      await pool.query(`
+        ALTER TABLE predictions 
+        ADD COLUMN IF NOT EXISTS risk_badge VARCHAR(20)
+      `);
+      await pool.query(`
+        ALTER TABLE predictions 
+        ADD COLUMN IF NOT EXISTS risk_score INTEGER
+      `);
+      await pool.query(`
+        ALTER TABLE predictions 
+        ADD COLUMN IF NOT EXISTS risk_color VARCHAR(10)
+      `);
+      await pool.query(`
+        ALTER TABLE predictions 
+        ADD COLUMN IF NOT EXISTS risk_emoji VARCHAR(10)
+      `);
+      await pool.query(`
+        ALTER TABLE predictions 
+        ADD COLUMN IF NOT EXISTS success_rate INTEGER
+      `);
+      await pool.query(`
+        ALTER TABLE predictions 
+        ADD COLUMN IF NOT EXISTS expected_value DECIMAL(4,2)
+      `);
+      await pool.query(`
+        ALTER TABLE predictions 
+        ADD COLUMN IF NOT EXISTS description_tr TEXT
+      `);
+      await pool.query(`
+        ALTER TABLE predictions 
+        ADD COLUMN IF NOT EXISTS estimated_time VARCHAR(20)
+      `);
+      await pool.query(`
+        ALTER TABLE predictions 
+        ADD COLUMN IF NOT EXISTS auto_calculated BOOLEAN DEFAULT true
+      `);
+      console.log('✅ Risk badge columns added to predictions table');
+    } catch (error) {
+      if (!error.message.includes('already exists') && !error.message.includes('duplicate')) {
+        console.log('ℹ️ Risk badge columns check:', error.message);
+      }
+    }
+    
+    // Create indexes for risk badge system
+    try {
+      await pool.query(`CREATE INDEX IF NOT EXISTS idx_predictions_filter ON predictions(filter_name)`);
+      await pool.query(`CREATE INDEX IF NOT EXISTS idx_predictions_risk ON predictions(risk_badge)`);
+      console.log('✅ Risk badge indexes created');
+    } catch (error) {
+      if (!error.message.includes('already exists')) {
+        console.log('ℹ️ Risk badge indexes check:', error.message);
+      }
+    }
+    
     console.log('✅ Table ready');
     
     // Create vip_access table
@@ -1337,7 +1401,7 @@ app.get('/api/test/completed-predictions',
 
 app.post('/api/predictions', async (req, res) => {
   try {
-    const { match_id, home_team, away_team, league, prediction_type, odds, confidence, home_logo, away_logo, league_flag, league_logo, home_score, away_score, is_urgent } = req.body;
+    const { match_id, home_team, away_team, league, prediction_type, odds, confidence, home_logo, away_logo, league_flag, league_logo, home_score, away_score, is_urgent, filterName } = req.body;
 
     if (!match_id || !home_team || !away_team || !prediction_type) {
       return res.status(400).json({ success: false, error: 'Missing fields' });
@@ -1346,12 +1410,40 @@ app.post('/api/predictions', async (req, res) => {
     const oddsValue = odds && !isNaN(parseFloat(odds)) ? parseFloat(odds) : 0;
     const isUrgentValue = is_urgent === true || is_urgent === 'true';
 
+    // Calculate smart risk badge
+    const riskData = calculateSmartRisk(filterName, oddsValue);
+
     const result = await pool.query(
       `INSERT INTO predictions 
-       (match_id, home_team, away_team, league, prediction_type, odds, confidence, status, home_logo, away_logo, league_flag, league_logo, home_score, away_score, is_urgent) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7, 'active', $8, $9, $10, $11, $12, $13, $14) 
+       (match_id, home_team, away_team, league, prediction_type, odds, confidence, status, home_logo, away_logo, league_flag, league_logo, home_score, away_score, is_urgent, filter_name, risk_badge, risk_score, risk_color, risk_emoji, success_rate, expected_value, description_tr, estimated_time, auto_calculated) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, 'active', $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24) 
        RETURNING *`,
-      [match_id, home_team, away_team, league, prediction_type, oddsValue, confidence || 'orta', home_logo || null, away_logo || null, league_flag || null, league_logo || null, home_score || 0, away_score || 0, isUrgentValue]
+      [
+        match_id, 
+        home_team, 
+        away_team, 
+        league, 
+        prediction_type, 
+        oddsValue, 
+        confidence || 'orta', 
+        home_logo || null, 
+        away_logo || null, 
+        league_flag || null, 
+        league_logo || null, 
+        home_score || 0, 
+        away_score || 0, 
+        isUrgentValue,
+        riskData.filter_name,
+        riskData.risk_badge,
+        riskData.risk_score,
+        riskData.risk_color,
+        riskData.risk_emoji,
+        riskData.success_rate,
+        riskData.expected_value,
+        riskData.description_tr,
+        riskData.estimated_time,
+        riskData.auto_calculated
+      ]
     );
 
     const prediction = result.rows[0];
@@ -1364,7 +1456,20 @@ app.post('/api/predictions', async (req, res) => {
     prediction.home_colors = homeColors;
     prediction.away_colors = awayColors;
 
-    res.status(201).json({ success: true, prediction: prediction });
+    res.status(201).json({ 
+      success: true, 
+      prediction: prediction,
+      risk: {
+        badge: riskData.risk_badge,
+        score: riskData.risk_score,
+        color: riskData.risk_color,
+        emoji: riskData.risk_emoji,
+        success_rate: riskData.success_rate,
+        expected_value: riskData.expected_value,
+        description_tr: riskData.description_tr,
+        estimated_time: riskData.estimated_time
+      }
+    });
   } catch (error) {
     console.error('❌ Create:', error);
     res.status(500).json({ success: false, error: 'Failed' });
