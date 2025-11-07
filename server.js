@@ -416,7 +416,13 @@ const pool = new Pool({
 });
 
 // JWT SECRET
-const JWT_SECRET = process.env.JWT_SECRET || 'flashgoal-secret-2025';
+const JWT_SECRET = process.env.JWT_SECRET;
+
+if (!JWT_SECRET) {
+  console.error('❌ FATAL ERROR: JWT_SECRET environment variable is not set!');
+  console.error('Please set JWT_SECRET in your .env file or environment variables.');
+  process.exit(1);
+}
 
 // EMAIL TRANSPORTER
 const emailTransporter = nodemailer.createTransport({
@@ -2153,75 +2159,229 @@ app.get('/api/referral/history',
 
 // ==========================================
 // POST /api/webhook/revenuecat (WEBHOOK - SECURE)
-// RevenueCat webhook handler with validation
+// RevenueCat webhook handler with signature verification
+// Handles 24h consumable purchases and subscription events
 // ==========================================
 app.post("/api/webhook/revenuecat", async (req, res) => {
+  const ip = req.ip || req.connection.remoteAddress;
+  
   try {
+    // ========================================
+    // 1. VERIFY WEBHOOK SIGNATURE
+    // ========================================
+    const authHeader = req.headers.authorization;
+    const webhookToken = process.env.REVENUECAT_WEBHOOK_TOKEN;
+    
+    // Verify authorization header if token is configured
+    if (webhookToken) {
+      if (!authHeader) {
+        console.error('❌ [RevenueCat Webhook] Missing authorization header');
+        return res.status(401).json({ 
+          success: false,
+          error: 'Unauthorized: Missing authorization header' 
+        });
+      }
+      
+      // RevenueCat sends: Bearer <webhook_token>
+      const token = authHeader.replace('Bearer ', '').trim();
+      
+      if (token !== webhookToken) {
+        console.error('❌ [RevenueCat Webhook] Invalid webhook token');
+        return res.status(401).json({ 
+          success: false,
+          error: 'Unauthorized: Invalid webhook token' 
+        });
+      }
+      
+      console.log('✅ [RevenueCat Webhook] Signature verified');
+    } else {
+      console.warn('⚠️  [RevenueCat Webhook] REVENUECAT_WEBHOOK_TOKEN not set - skipping verification');
+    }
+    
+    // ========================================
+    // 2. PARSE WEBHOOK PAYLOAD
+    // ========================================
     const event = req.body;
     
-    // Validate webhook payload
-    if (!event.type || !event.app_user_id) {
+    // Validate webhook payload structure
+    if (!event || typeof event !== 'object') {
+      console.error('❌ [RevenueCat Webhook] Invalid payload structure');
       return res.status(400).json({ 
-        error: 'Invalid webhook payload' 
+        success: false,
+        error: 'Invalid webhook payload structure' 
       });
     }
     
-    // Production-safe logging
-    if (process.env.NODE_ENV !== 'production') {
-      console.log("RevenueCat webhook:", event.type);
+    const eventType = event.type || event.event;
+    const appUserId = event.app_user_id;
+    const productId = event.product_id;
+    
+    // Validate required fields
+    if (!eventType || !appUserId) {
+      console.error('❌ [RevenueCat Webhook] Missing required fields:', { eventType, appUserId });
+      return res.status(400).json({ 
+        success: false,
+        error: 'Missing required fields: type and app_user_id' 
+      });
     }
     
-    // Process purchase events
-    if (event.type === "INITIAL_PURCHASE" || event.type === "RENEWAL") {
-      const userId = event.app_user_id;
-      const productId = event.product_id;
-      
-      if (!userId || !productId) {
-        return res.status(400).json({ error: 'Missing userId or productId' });
-      }
-      
-      if (productId === "com.flashgoal.vip.24h") {
-        const expiryDate = new Date();
-        expiryDate.setHours(expiryDate.getHours() + 24);
+    console.log(`📥 [RevenueCat Webhook] Event received: ${eventType} for user: ${appUserId}${productId ? `, product: ${productId}` : ''}`);
+    
+    // ========================================
+    // 3. HANDLE 24H CONSUMABLE PURCHASES
+    // ========================================
+    if (
+      (eventType === 'INITIAL_PURCHASE' || eventType === 'NON_RENEWING_PURCHASE') &&
+      productId === 'com.flashgoal.vip.24h'
+    ) {
+      try {
+        // Calculate 24 hours from now
+        const vipExpiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
         
-        await pool.query(
-          `INSERT INTO vip_access (user_id, expiry_date, product_id) 
-           VALUES ($1, $2, $3)
-           ON CONFLICT (user_id) 
-           DO UPDATE SET expiry_date = $2, product_id = $3, updated_at = NOW()`,
-          [userId, expiryDate, productId]
+        // Check if user already has VIP access
+        const existingVIP = await pool.query(
+          `SELECT expiry_date FROM vip_access WHERE user_id = $1`,
+          [appUserId]
         );
         
-        if (process.env.NODE_ENV !== 'production') {
-          console.log(`24h VIP activated for user: ${userId}`);
-        }
-      } else {
-        const expiryDate = new Date(event.expiration_at_ms);
+        let finalExpiryDate = vipExpiresAt;
         
-        if (isNaN(expiryDate.getTime())) {
-          return res.status(400).json({ error: 'Invalid expiration date' });
+        // If user has existing VIP that hasn't expired, add 24h to existing expiry
+        if (existingVIP.rows.length > 0) {
+          const existingExpiry = new Date(existingVIP.rows[0].expiry_date);
+          const now = new Date();
+          
+          if (existingExpiry > now) {
+            // Add 24 hours to existing expiry date
+            finalExpiryDate = new Date(existingExpiry.getTime() + 24 * 60 * 60 * 1000);
+            console.log(`⏰ [RevenueCat Webhook] Extending existing VIP for user: ${appUserId}`);
+          }
         }
         
+        // Update or insert VIP access
         await pool.query(
-          `INSERT INTO vip_access (user_id, expiry_date, product_id) 
-           VALUES ($1, $2, $3)
+          `INSERT INTO vip_access (user_id, expiry_date, product_id, created_at, updated_at)
+           VALUES ($1, $2, $3, NOW(), NOW())
            ON CONFLICT (user_id) 
-           DO UPDATE SET expiry_date = $2, product_id = $3, updated_at = NOW()`,
-          [userId, expiryDate, productId]
+           DO UPDATE SET 
+             expiry_date = $2, 
+             product_id = $3, 
+             updated_at = NOW()`,
+          [appUserId, finalExpiryDate, productId]
         );
         
-        if (process.env.NODE_ENV !== 'production') {
-          console.log(`Subscription activated for user: ${userId}`);
-        }
+        console.log(`✅ [RevenueCat Webhook] 24h VIP activated for user: ${appUserId}, expires: ${finalExpiryDate.toISOString()}`);
+        
+        return res.status(200).json({ 
+          success: true,
+          message: '24h VIP activated',
+          userId: appUserId,
+          expiresAt: finalExpiryDate.toISOString()
+        });
+        
+      } catch (dbError) {
+        console.error('❌ [RevenueCat Webhook] Database error processing 24h VIP:', dbError);
+        return res.status(500).json({ 
+          success: false,
+          error: 'Failed to process 24h VIP purchase' 
+        });
       }
     }
     
-    res.status(200).send("OK");
+    // ========================================
+    // 4. HANDLE SUBSCRIPTION RENEWALS
+    // ========================================
+    if (eventType === 'RENEWAL') {
+      try {
+        if (!productId) {
+          console.error('❌ [RevenueCat Webhook] Missing product_id for RENEWAL event');
+          return res.status(400).json({ 
+            success: false,
+            error: 'Missing product_id for renewal event' 
+          });
+        }
+        
+        // Subscriptions are handled by RevenueCat entitlements
+        // This is just for logging purposes
+        const expiryDate = event.expiration_at_ms 
+          ? new Date(event.expiration_at_ms)
+          : null;
+        
+        if (expiryDate && !isNaN(expiryDate.getTime())) {
+          await pool.query(
+            `INSERT INTO vip_access (user_id, expiry_date, product_id, created_at, updated_at)
+             VALUES ($1, $2, $3, NOW(), NOW())
+             ON CONFLICT (user_id) 
+             DO UPDATE SET 
+               expiry_date = $2, 
+               product_id = $3, 
+               updated_at = NOW()`,
+            [appUserId, expiryDate, productId]
+          );
+          
+          console.log(`✅ [RevenueCat Webhook] Subscription renewed for user: ${appUserId}, product: ${productId}`);
+        } else {
+          console.log(`ℹ️  [RevenueCat Webhook] RENEWAL event logged (entitlements handled by RevenueCat) for user: ${appUserId}`);
+        }
+        
+        return res.status(200).json({ 
+          success: true,
+          message: 'Renewal processed',
+          userId: appUserId,
+          productId: productId
+        });
+        
+      } catch (dbError) {
+        console.error('❌ [RevenueCat Webhook] Database error processing renewal:', dbError);
+        return res.status(500).json({ 
+          success: false,
+          error: 'Failed to process renewal' 
+        });
+      }
+    }
+    
+    // ========================================
+    // 5. HANDLE CANCELLATION (Optional Logging)
+    // ========================================
+    if (eventType === 'CANCELLATION') {
+      console.log(`ℹ️  [RevenueCat Webhook] Subscription cancelled for user: ${appUserId}, product: ${productId || 'unknown'}`);
+      
+      // Note: We don't remove VIP access immediately on cancellation
+      // RevenueCat will stop renewals, and VIP will expire naturally
+      // This is just for logging/debugging purposes
+      
+      return res.status(200).json({ 
+        success: true,
+        message: 'Cancellation logged',
+        userId: appUserId,
+        productId: productId
+      });
+    }
+    
+    // ========================================
+    // 6. UNKNOWN EVENT TYPE (Log but don't fail)
+    // ========================================
+    console.log(`⚠️  [RevenueCat Webhook] Unknown event type: ${eventType} for user: ${appUserId}`);
+    
+    return res.status(200).json({ 
+      success: true,
+      message: 'Event received but not processed',
+      eventType: eventType,
+      userId: appUserId
+    });
+    
   } catch (error) {
-    if (process.env.NODE_ENV !== 'production') {
-      console.error("Webhook error:", error);
-    }
-    res.status(500).send("Error");
+    console.error('❌ [RevenueCat Webhook] Unexpected error:', error);
+    console.error('Error details:', {
+      message: error.message,
+      stack: error.stack,
+      ip: ip
+    });
+    
+    return res.status(500).json({ 
+      success: false,
+      error: 'Internal server error processing webhook' 
+    });
   }
 });
 
