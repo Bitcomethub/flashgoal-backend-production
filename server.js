@@ -36,6 +36,19 @@ const rateLimitStore = new Map();
 const loginAttemptStore = new Map();
 const forgotPasswordAttemptStore = new Map();
 
+// Simple in-memory cache for live odds (5 minutes)
+const oddsCache = new Map();
+
+// Cleanup expired cache entries every 10 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, value] of oddsCache.entries()) {
+    if (now - value.timestamp > 300000) { // 5 minutes = 300000ms
+      oddsCache.delete(key);
+    }
+  }
+}, 600000); // Check every 10 minutes
+
 // Rate limiting middleware (batch endpoint için)
 const rateLimitBatch = (req, res, next) => {
   const ip = req.ip || req.connection.remoteAddress;
@@ -1475,6 +1488,180 @@ app.post('/api/predictions', async (req, res) => {
     res.status(500).json({ success: false, error: 'Failed' });
   }
 });
+
+// ==========================================
+// GET /api/admin/live-odds/:fixtureId (ADMIN ONLY)
+// Get live odds from API-Football (only goal-related odds)
+// ==========================================
+app.get('/api/admin/live-odds/:fixtureId',
+  authenticateToken,
+  requireAdmin,
+  rateLimitAdmin(30, 60 * 1000), // 30 per minute
+  async (req, res) => {
+    try {
+      const { fixtureId } = req.params;
+      
+      // Validate fixture ID
+      const fixtureIdNum = parseInt(fixtureId);
+      if (isNaN(fixtureIdNum) || fixtureIdNum <= 0) {
+        return res.status(400).json({ 
+          success: false, 
+          error: 'Invalid fixture ID' 
+        });
+      }
+      
+      // Cache kontrolü (5 dakika)
+      const cacheKey = `live_odds_${fixtureIdNum}`;
+      const cached = oddsCache.get(cacheKey);
+      if (cached && (Date.now() - cached.timestamp) < 300000) {
+        return res.json({ 
+          success: true, 
+          odds: cached.data,
+          bookmaker: cached.bookmaker,
+          lastUpdate: cached.lastUpdate,
+          cached: true
+        });
+      }
+      
+      // API-Football Live Odds
+      const response = await axios.get(
+        'https://v3.football.api-sports.io/odds/live',
+        {
+          params: { fixture: fixtureIdNum },
+          headers: {
+            'x-apisports-key': process.env.FOOTBALL_API_KEY,
+            'x-rapidapi-host': 'v3.football.api-sports.io'
+          },
+          timeout: 10000
+        }
+      );
+      
+      const data = response.data;
+      
+      if (!data.response || data.response.length === 0) {
+        return res.json({ 
+          success: false, 
+          message: 'Bu maç için canlı oran bulunamadı' 
+        });
+      }
+      
+      // Bet365 oranlarını tercih et
+      const bet365Data = data.response.find(
+        (bookmaker) => bookmaker.bookmaker && bookmaker.bookmaker.name === 'Bet365'
+      );
+      
+      const bookmakerData = bet365Data || data.response[0];
+      
+      if (!bookmakerData || !bookmakerData.bets) {
+        return res.json({ 
+          success: false, 
+          message: 'Bu maç için bahis verisi bulunamadı' 
+        });
+      }
+      
+      // SADECE GOL ORANLARI parse et
+      const parsedOdds = {
+        btts: null,  // Karşılıklı Gol
+        overUnder: {},  // 0.5'ten 9.5'e kadar
+        homeGoals: {},  // Ev sahibi gol oranları
+        awayGoals: {},  // Deplasman gol oranları
+      };
+      
+      bookmakerData.bets.forEach((bet) => {
+        if (!bet || !bet.name || !bet.values) return;
+        
+        // BTTS (Karşılıklı Gol)
+        if (bet.name === 'Both Teams Score') {
+          const yesValue = bet.values.find(v => v.value === 'Yes');
+          const noValue = bet.values.find(v => v.value === 'No');
+          parsedOdds.btts = {
+            yes: yesValue ? parseFloat(yesValue.odd) : null,
+            no: noValue ? parseFloat(noValue.odd) : null,
+          };
+        }
+        
+        // Goals Over/Under (0.5 - 9.5)
+        if (bet.name === 'Goals Over/Under') {
+          bet.values.forEach((v) => {
+            if (!v.value || !v.odd) return;
+            const match = v.value.match(/(Over|Under)\s+([\d.]+)/);
+            if (match) {
+              const type = match[1].toLowerCase();  // 'over' veya 'under'
+              const total = match[2];  // '0.5', '1.5', '2.5', vs.
+              
+              if (!parsedOdds.overUnder[total]) {
+                parsedOdds.overUnder[total] = {};
+              }
+              parsedOdds.overUnder[total][type] = parseFloat(v.odd);
+            }
+          });
+        }
+        
+        // Home Team Goals (Ev sahibi gol)
+        if (bet.name === 'Home Team Goals' || bet.name === 'Home Over/Under') {
+          bet.values.forEach((v) => {
+            if (!v.value || !v.odd) return;
+            const match = v.value.match(/(Over|Under)\s+([\d.]+)/);
+            if (match) {
+              const type = match[1].toLowerCase();
+              const total = match[2];
+              
+              if (!parsedOdds.homeGoals[total]) {
+                parsedOdds.homeGoals[total] = {};
+              }
+              parsedOdds.homeGoals[total][type] = parseFloat(v.odd);
+            }
+          });
+        }
+        
+        // Away Team Goals (Deplasman gol)
+        if (bet.name === 'Away Team Goals' || bet.name === 'Away Over/Under') {
+          bet.values.forEach((v) => {
+            if (!v.value || !v.odd) return;
+            const match = v.value.match(/(Over|Under)\s+([\d.]+)/);
+            if (match) {
+              const type = match[1].toLowerCase();
+              const total = match[2];
+              
+              if (!parsedOdds.awayGoals[total]) {
+                parsedOdds.awayGoals[total] = {};
+              }
+              parsedOdds.awayGoals[total][type] = parseFloat(v.odd);
+            }
+          });
+        }
+      });
+      
+      const bookmakerName = bookmakerData.bookmaker ? bookmakerData.bookmaker.name : 'Unknown';
+      const lastUpdate = new Date().toISOString();
+      
+      // 5 dakika cache
+      oddsCache.set(cacheKey, {
+        data: parsedOdds,
+        bookmaker: bookmakerName,
+        lastUpdate: lastUpdate,
+        timestamp: Date.now()
+      });
+      
+      res.json({ 
+        success: true, 
+        odds: parsedOdds,
+        bookmaker: bookmakerName,
+        lastUpdate: lastUpdate,
+        cached: false
+      });
+      
+    } catch (error) {
+      if (process.env.NODE_ENV !== 'production') {
+        console.error('Live odds error:', error.message);
+      }
+      res.status(500).json({ 
+        success: false, 
+        error: 'Canlı oranlar alınamadı' 
+      });
+    }
+  }
+);
 
 // ==========================================
 // PUT /api/predictions/:id/result (ADMIN ONLY - SECURE)
